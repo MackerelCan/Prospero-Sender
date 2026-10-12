@@ -487,8 +487,7 @@ class Installer:
         overrides = {dll: "n" for dll in dxvk_dlls}
         overrides.update(self.overrides)
         if self.graphics_mode() == "opengl":
-            # OpenGL draws through Mesa's Zink (v0.2.0): the app's native opengl32.
-            overrides["opengl32"] = "n"
+            overrides["opengl32"] = "b"
         by_mode: dict[str, list[str]] = {}
         for dll, mode in overrides.items():
             by_mode.setdefault(mode, []).append(dll)

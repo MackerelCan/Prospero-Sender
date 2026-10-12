@@ -186,6 +186,13 @@ class App:
         self.source: pw_quick.Source | None = None
         self.exes: list[pw_quick.Executable] = []
         settings = load_settings()
+        self.lanes = tk.StringVar(value=str(settings.get("lanes", pw_quick.FTP_LANES)))
+
+        menubar = tk.Menu(root)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="FTP connections…", command=self.edit_lanes)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        root.config(menu=menubar)
 
         root.title(TITLE)
         root.minsize(620, 0)
@@ -244,6 +251,8 @@ class App:
         self.check_button.grid(row=0, column=4)
         self.logs_button = ttk.Button(ps5, text="Get logs", command=self.get_logs)
         self.logs_button.grid(row=0, column=5, padx=(6, 0))
+        self.games_button = ttk.Button(ps5, text="Installed games…", command=self.open_games)
+        self.games_button.grid(row=0, column=6, padx=(6, 0))
 
         loader = ttk.LabelFrame(outer, text="Payloads", padding=10)
         loader.grid(sticky="ew", pady=(0, 10))
@@ -373,7 +382,38 @@ class App:
             entry["on"] = index in chosen
         save_settings({"host": self.host.get().strip(), "port": self.port.get().strip(),
                        "base": self.base.get().strip(), "desktop": self.desktop.get().strip(),
-                       "elf_port": self.elf_port.get().strip(), "payloads": self.payloads})
+                       "elf_port": self.elf_port.get().strip(), "payloads": self.payloads,
+                       "lanes": self.lanes.get().strip()})
+
+    def edit_lanes(self) -> None:
+        """Settings > FTP connections: how many connections a send uses at once."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("FTP connections")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.grid(sticky="nsew")
+        value = tk.StringVar(value=self.lanes.get())
+        low, high = pw_quick.FTP_LANES_RANGE
+        ttk.Label(frame, text=f"Connections to the PS5 for a send ({low} to {high}):", wraplength=320,
+                  justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Spinbox(frame, from_=low, to=high, textvariable=value, width=6).grid(row=1, column=0, sticky="w", pady=8)
+        ttk.Label(frame, text=f"Default {pw_quick.FTP_LANES}. More is faster only if the PS5 keeps up;\n"
+                              "if it refuses connections, a send uses fewer.", justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+
+        def save() -> None:
+            try:
+                lanes = pw_quick.parse_lanes(value.get())
+            except QuickError as error:
+                messagebox.showerror("FTP connections", str(error), parent=dialog)
+                return
+            self.lanes.set(str(lanes))
+            self.remember()
+            dialog.destroy()
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0)
+        ttk.Button(buttons, text="Save", command=save).grid(row=0, column=1, padx=(6, 0))
 
     # --- payloads ----------------------------------------------------------------
     def show_payloads(self) -> None:
@@ -671,7 +711,8 @@ class App:
             remote = pw_quick.connect(host, port)
             try:
                 sender = pw_quick.Sender(remote, game, source, base, dxvk=dxvk, host=host, report=report,
-                                         cancel=self.cancel, mono=mono)
+                                         cancel=self.cancel, mono=mono,
+                                         lanes=pw_quick.parse_lanes(self.lanes.get()))
                 if settings_only:
                     sender.update_settings()
                 else:
@@ -747,6 +788,15 @@ class App:
                 pass
         self.run(work, done)
 
+    def open_games(self) -> None:
+        try:
+            host, port = self.address()
+        except QuickError as error:
+            messagebox.showerror("prospero-win", str(error), parent=self.root)
+            return
+        self.remember()
+        GamesWindow(self, host, port)
+
     def install_app(self) -> None:
         try:
             host, port = self.address()
@@ -792,6 +842,106 @@ class App:
             self.cancel.set()
         self.remember()
         self.root.destroy()
+
+
+class GamesWindow:
+    """The games on the PS5: export a game's saves, or delete the game."""
+
+    def __init__(self, app: "App", host: str, port: int):
+        self.app, self.host, self.port = app, host, port
+        self.games: list[tuple[str, str]] = []
+        self.window = tk.Toplevel(app.root)
+        self.window.title(f"Installed games on {host}")
+        self.window.transient(app.root)
+        frame = ttk.Frame(self.window, padding=12)
+        frame.grid(sticky="nsew")
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(frame, height=12, width=52, activestyle="none", exportselection=False)
+        self.listbox.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        self.listbox.bind("<<ListboxSelect>>", lambda event: self.update_buttons())
+        self.refresh_button = ttk.Button(frame, text="Refresh", command=self.refresh)
+        self.refresh_button.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.export_button = ttk.Button(frame, text="Export saves…", command=self.export, state="disabled")
+        self.export_button.grid(row=1, column=1, sticky="e", pady=(8, 0), padx=(6, 0))
+        self.delete_button = ttk.Button(frame, text="Delete from PS5…", command=self.delete, state="disabled")
+        self.delete_button.grid(row=1, column=2, sticky="e", pady=(8, 0), padx=(6, 0))
+        self.status = tk.StringVar(value="Getting the list from the PS5…")
+        ttk.Label(frame, textvariable=self.status, wraplength=460, justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.refresh()
+
+    def selected(self) -> tuple[str, str] | None:
+        picked = self.listbox.curselection()
+        return self.games[picked[0]] if picked else None
+
+    def update_buttons(self) -> None:
+        state = "normal" if self.selected() else "disabled"
+        self.export_button.configure(state=state)
+        self.delete_button.configure(state=state)
+
+    def connect_and(self, action):
+        """Runs action(remote) on the PS5 in the background, after a connection."""
+        def work(report):
+            remote = pw_quick.connect(self.host, self.port)
+            try:
+                return action(remote)
+            finally:
+                remote.close()
+        return work
+
+    def refresh(self) -> None:
+        self.status.set("Getting the list from the PS5…")
+
+        def done(games) -> None:
+            self.games = games
+            self.listbox.delete(0, "end")
+            for slug, shown in games:
+                self.listbox.insert("end", f"{shown}  ({slug})")
+            self.status.set(f"{len(games)} game(s) on the PS5." if games else "No games on the PS5 yet.")
+            self.update_buttons()
+        self.app.run(self.connect_and(pw_quick.installed_games), done)
+
+    def export(self) -> None:
+        picked = self.selected()
+        if not picked:
+            return
+        slug, shown = picked
+        folder = filedialog.askdirectory(parent=self.window, title=f"Save {shown}'s saves in…",
+                                         initialdir=str(here() / "saves"))
+        if not folder:
+            return
+        stamp = time.strftime("%Y-%m-%d-%H%M%S")
+        self.status.set(f"Copying {shown}'s saves from the PS5…")
+
+        def done(result) -> None:
+            out, count = result
+            self.status.set(f"Saved {count} file(s) to {out}.")
+            try:
+                if sys.platform == "win32":
+                    subprocess.Popen(["explorer", "/select,", str(out)])
+            except OSError:
+                pass
+        self.app.run(self.connect_and(lambda remote: pw_quick.export_saves(remote, slug, folder, stamp)), done)
+
+    def delete(self) -> None:
+        picked = self.selected()
+        if not picked:
+            return
+        slug, shown = picked
+        if not messagebox.askyesno(
+                "Delete from the PS5",
+                f"Delete {shown} from the PS5?\n\nIts files, its save files on the PS5 and its "
+                "settings there are deleted. Export its saves first if you want to keep them.",
+                parent=self.window):
+            return
+        self.status.set(f"Deleting {shown} from the PS5…")
+
+        def done(_) -> None:
+            self.status.set(f"Deleted {shown}.")
+            self.refresh()
+        self.app.run(self.connect_and(lambda remote: pw_quick.delete_game(remote, slug, host=self.host)), done)
 
 
 def main() -> int:

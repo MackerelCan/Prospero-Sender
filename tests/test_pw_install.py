@@ -208,8 +208,8 @@ def main() -> int:
         opengl_profile = (library / "profiles" / "opengl-game.profile").read_text()
         assert "graphics = opengl" in opengl_profile.splitlines()
         assert "d3d8=n" not in opengl_profile
-        assert "opengl32=n" in opengl_profile      # OpenGL draws through Zink (v0.2.0)
-        assert "opengl32=b" not in opengl_profile
+        assert "opengl32=b" in opengl_profile
+        assert "opengl32=n" not in opengl_profile
         assert not (opengl_prefix / "drive_c/windows/syswow64/d3d8.dll").exists()
         assert '"d3d8"="native"' not in (opengl_prefix / "user.reg").read_text()
 
