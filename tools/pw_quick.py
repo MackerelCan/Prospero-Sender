@@ -1,0 +1,1591 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Send an already-installed Windows game to the console in one step.
+
+tools/pw_install.py and tools/pw_prefix.py cover every game, but they need a
+Linux PC with the pinned Wine, because the console cannot make a prefix
+(wineboot is off there). Many games need nothing an installer does: a folder
+copied from a Windows PC, a GOG or Steam install, a zip of either. For
+those, this tool needs no Wine at all:
+
+- the prefix is a base prefix, made once with the pinned Wine by
+  tools/pw_base_prefix.py and shared as a zip (it holds only Wine's files);
+- the game's files go to C:\\Games\\<slug> inside it, read straight out of
+  the game's zip or folder;
+- the profile is written from the game's executable: its architecture from
+  the PE header, the graphics backend from the DLLs it and the game's own
+  DLLs import (Direct3D 8-11 through DXVK, OpenGL, or GDI);
+- DXVK's DLLs, when the game uses Direct3D, come from the pinned release
+  (tools/pw_install.py's DXVK_RELEASES);
+- wowprospero.dll comes from the app already installed on the console;
+- everything is streamed over FTP (tools/pw_prefix.py's FtpRemote), and a
+  record of each file the console has lets an interrupted send resume.
+
+tools/pw_gui.py puts a window on this; the command line is for scripts:
+
+    pw_quick.py GAME.zip|DIR --base BASE.zip|DIR --host IP [--port 2121]
+        [--name NAME] [--slug SLUG] [--exe PATH] [--graphics auto|gdi|dxvk|opengl]
+        [--desktop WxH] [--preset NAME] [--overwrite]
+    pw_quick.py --install-app prospero-win-<version>.zip --host IP
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import ftplib
+import io
+import json
+import os
+import posixpath
+import re
+import socket
+import struct
+import sys
+import tarfile
+import threading
+import time
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Callable, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pw_autoconfig  # noqa: E402
+import pw_prefix  # noqa: E402
+from pw_prefix import CHUNK, CPU_DLL, REGISTRY, FtpRemote, to_console  # noqa: E402
+
+REMOTE_ROOT = "/data/prospero-win"
+# The app's own folder, where the release's PPSA99995 folder goes.
+TITLE_ID = "PPSA99995"
+APP_ROOT = f"/data/homebrew/{TITLE_ID}"
+# The translator the app ships (tools/package_release.sh), which a prefix
+# needs in its own system32 (pw_prefix.CPU_DLL).
+APP_CPU_DLL = f"{APP_ROOT}/win/wine/lib/wine/x86_64-windows/wowprospero.dll"
+GAMES = "drive_c/Games"
+# The C: and Z: drives, as pw_prefix.py's push writes a prefix's links.
+BASE_LINKS = f"dosdevices/{pw_prefix.LINK_TABLE}"
+DXVK_VERSION = "2.6.2"
+FTP_ATTEMPTS = 6
+# FTP connections a send uses at once. Every file costs a few round trips
+# before its bytes move (PASV, the data connection, STOR, SIZE), which for a
+# prefix's thousands of small files is most of the time; ftpsrv serves each
+# connection on its own thread, so they overlap.
+FTP_LANES = 4
+# Wine Mono, Wine's .NET Framework 4 stand-in, for .NET Framework and XNA
+# games: one copy on the console, which each such game's prefix points at
+# (HKCU\Software\Wine\Mono RuntimePath; Z: is the console's /). The
+# version is the one the app's Wine asks for (dlls/appwiz.cpl/addons.c).
+MONO_VERSION = "11.3.0"
+MONO_NAME = f"wine-mono-{MONO_VERSION}"
+MONO_ENGINES = (".NET Framework", "XNA")
+MONO_KEY = "Software\\Wine\\Mono"
+MONO_MARKER = ".pw-complete"
+UNSHARE_LIMIT = 512 << 20
+DXVK_DLLS = ("d3d8", "d3d9", "d3d10core", "d3d11", "dxgi")
+GRAPHICS = ("auto", "gdi", "dxvk", "d3d12", "opengl")
+# Direct3D 12 games: DXVK for dxgi (and the older Direct3D), and beside the
+# game's exe vkd3d-proton 3.0.1 behind a small proxy d3d12.dll
+# (tools/d3d12_proxy): Windows' ordinals, a feature level the PS5's device
+# can make (it tops out at 11_1; Hades II asks for 12_1), and a RAM floor
+# for games that check (Wine reports about 546 MB on the console).
+D3D12_FILES = ("d3d12.dll", "d3d12_original.dll", "d3d12core.dll")
+D3D12_ENVIRONMENT = {"PW_FAKE_RAM_GB": "16"}
+SCALING = ("fit", "integer", "stretch")
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+# Files a zip or a copied folder carries that the game does not need.
+JUNK = ("__MACOSX/*", "*/.DS_Store", ".DS_Store", "Thumbs.db", "*/Thumbs.db", "desktop.ini", "*/desktop.ini")
+# Executables that are rarely the game itself.
+NOT_THE_GAME = re.compile(
+    r"unins|setup|install|vcredist|vc_redist|dxsetup|dxwebsetup|directx|redist|crash|report|"
+    r"update|patch|config|settings|dotnet|ue4prereq|prereq|easyanticheat|battleye|^be_|cleanup|"
+    r"launcher|register|activation|helper|server|dedicated|benchmark|editor|tool|7z|unrar|python|java")
+D3D = re.compile(r"^(d3d8|d3d9|d3d10(_1)?(core)?|d3d11|dxgi)\.dll$")
+SCAN_DLLS, SCAN_LIMIT = 400, 96 << 20
+PRESETS = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "presets"
+# Assemblies a .NET Framework game names but a store build leaves out, which
+# Wine Mono needs anyway: Mono loads the types of every field of a class it
+# compiles, where .NET waits until the code runs. Stardew Valley from GOG
+# names Steamworks.NET 7 in a class it never uses, and died on Mono without
+# it. tools/build_steamworks.sh makes the stand-in (MIT, as Steamworks.NET),
+# whose SteamAPI.Init answers false without Steam.
+STUBS = PRESETS.parent / "stubs"
+D3D12_DIR = PRESETS.parent / "d3d12"
+# pwexec, the launcher loader (tools/pwexec): runs a launcher and the program
+# it starts in one process, since the console can't start a second one.
+PWEXEC_DIR = PRESETS.parent / "pwexec"
+PWEXEC_NAMES = {32: "pwexec32.exe", 64: "pwexec64.exe"}
+# The app's 32-bit translator front end (wine/wowprospero/cpu.c, built
+# against v0.1.1's interface), with the segment register instructions the
+# translator and its host fallback lack done here (legacy_ops.h: segment
+# registers, BCD, ENTER, far transfers, INT3/privileged instructions as
+# Windows raises them). Used over the app's copy.
+BUNDLED_CPU_DLL = PRESETS.parent / "cpu" / "wowprospero.dll"
+STUB_ASSEMBLIES = ("Steamworks.NET",)
+STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+                 or Path.home() / ".local" / "state") / "prospero-win" / "quick"
+
+
+class QuickError(Exception):
+    pass
+
+
+class NeedsOverwrite(QuickError):
+    """The console already has this game, and this PC never sent it."""
+
+
+class Cancelled(Exception):
+    pass
+
+
+# --- where files come from ---------------------------------------------------
+class Source:
+    """A zip or a folder, as a flat list of files (posix paths) and folders.
+    A zip whose files all sit in one top folder is read from inside it."""
+
+    def __init__(self, path: str | os.PathLike):
+        self.path = Path(path)
+        self.files: dict[str, int] = {}
+        self.dirs: set[str] = set()
+        self.zip: zipfile.ZipFile | None = None
+        self.links = 0      # symbolic links in a folder, which are left out
+        self.lock = threading.Lock()
+        if self.path.is_dir():
+            self._scan_dir()
+        elif zipfile.is_zipfile(self.path):
+            self._scan_zip()
+        else:
+            raise QuickError(f"{self.path} is neither a folder nor a zip")
+        if not self.files:
+            raise QuickError(f"{self.path} holds no files")
+
+    def _scan_dir(self) -> None:
+        root = self.path
+        for directory, subdirs, names in os.walk(root):
+            relative = Path(directory).relative_to(root).as_posix()
+            relative = "" if relative == "." else relative
+            for name in list(subdirs):
+                if os.path.islink(os.path.join(directory, name)):
+                    subdirs.remove(name)
+                    self.links += 1
+            for name in names:
+                key = posixpath.join(relative, name) if relative else name
+                if os.path.islink(os.path.join(directory, name)):
+                    self.links += 1
+                elif not junk(key) and os.path.isfile(os.path.join(directory, name)):
+                    self.files[key] = os.path.getsize(os.path.join(directory, name))
+            if relative:
+                self.dirs.add(relative)
+        self.prefix = ""
+
+    def _scan_zip(self) -> None:
+        self.zip = zipfile.ZipFile(self.path)
+        names = []
+        for info in self.zip.infolist():
+            name = info.filename.replace("\\", "/")
+            if junk(name) or name.startswith("/") or ".." in PurePosixPath(name).parts:
+                continue
+            names.append((name, info))
+        tops = {name.split("/", 1)[0] for name, info in names if "/" in name.rstrip("/") or info.is_dir()}
+        loose = [name for name, info in names if "/" not in name.rstrip("/") and not info.is_dir()]
+        self.prefix = f"{tops.pop()}/" if len(tops) == 1 and not loose else ""
+        self.members: dict[str, zipfile.ZipInfo] = {}
+        for name, info in names:
+            if not name.startswith(self.prefix):
+                continue
+            key = name[len(self.prefix):].rstrip("/")
+            if not key:
+                continue
+            if info.is_dir():
+                self.dirs.add(key)
+            else:
+                self.files[key] = info.file_size
+                self.members[key] = info
+        for key in list(self.files):
+            parent = posixpath.dirname(key)
+            while parent:
+                self.dirs.add(parent)
+                parent = posixpath.dirname(parent)
+
+    @property
+    def name(self) -> str:
+        """The game's likely name: the zip's top folder, or the file or folder name."""
+        if self.prefix:
+            return self.prefix.rstrip("/")
+        return self.path.stem if self.zip else self.path.name
+
+    def open(self, key: str):
+        if self.zip is not None:
+            return self.zip.open(self.members[key])
+        return open(self.path / key, "rb")
+
+    def read(self, key: str, limit: int | None = None) -> bytes:
+        with self.lock, self.open(key) as stream:
+            return stream.read() if limit is None else stream.read(limit)
+
+    def close(self) -> None:
+        if self.zip is not None:
+            self.zip.close()
+
+
+def junk(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in JUNK)
+
+
+# --- reading executables -------------------------------------------------------
+@dataclass
+class PeInfo:
+    bits: int
+    imports: set[str]
+    gui: bool
+
+
+SCN_MEM_SHARED = 0x10000000
+
+
+def unshared(data: bytes) -> bytes | None:
+    """The PE image with its shared sections made private, or None when it
+    has none. The console's Wine can't map a shared section that isn't
+    page-aligned there (UNDERTALE.exe's .mydata: "cannot run ... c000007b");
+    one copy of the game runs at a time, so private is the same to it."""
+    try:
+        if data[:2] != b"MZ":
+            return None
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            return None
+        sections, optional_size = struct.unpack_from("<H12xH", data, pe + 6)
+        table = pe + 24 + optional_size
+        patched = None
+        for index in range(sections):
+            at = table + 40 * index + 36
+            flags = struct.unpack_from("<I", data, at)[0]
+            if flags & SCN_MEM_SHARED:
+                patched = patched or bytearray(data)
+                struct.pack_into("<I", patched, at, flags & ~SCN_MEM_SHARED)
+        return bytes(patched) if patched else None
+    except struct.error:
+        return None
+
+
+def pe_info(data: bytes) -> PeInfo | None:
+    """Architecture, subsystem and imported DLLs (normal and delay-loaded) of
+    a PE image, or None when data is not one."""
+    try:
+        if data[:2] != b"MZ":
+            return None
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            return None
+        sections, optional_size = struct.unpack_from("<H12xH", data, pe + 6)
+        optional = pe + 24
+        magic = struct.unpack_from("<H", data, optional)[0]
+        if magic not in (0x10B, 0x20B):
+            return None
+        bits = 32 if magic == 0x10B else 64
+        subsystem = struct.unpack_from("<H", data, optional + 68)[0]
+        directories = optional + (96 if bits == 32 else 112)
+        count = struct.unpack_from("<I", data, directories - 4)[0]
+        table = optional + optional_size
+        spans = []
+        for index in range(sections):
+            size, address, raw_size, raw = struct.unpack_from("<4xIIII", data, table + 40 * index + 4)
+            spans.append((address, max(size, raw_size), raw))
+
+        def offset(rva: int) -> int | None:
+            for address, size, raw in spans:
+                if address <= rva < address + size:
+                    return rva - address + raw
+            return rva if rva < (spans[0][2] if spans else len(data)) else None
+
+        def string(rva: int) -> str:
+            start = offset(rva)
+            if start is None or start >= len(data):
+                return ""
+            end = data.find(b"\0", start, start + 256)
+            return data[start:end if end >= 0 else start + 256].decode("latin-1").lower()
+
+        imports: set[str] = set()
+        for index, stride, name_at in ((1, 20, 12), (13, 32, 4)):   # imports, delay imports
+            if count <= index:
+                continue
+            rva = struct.unpack_from("<I", data, directories + 8 * index)[0]
+            at = offset(rva) if rva else None
+            while at is not None and at + stride <= len(data) and len(imports) < 512:
+                entry = data[at:at + stride]
+                if not any(entry):
+                    break
+                name_rva = struct.unpack_from("<I", entry, name_at)[0]
+                if name_rva:
+                    name = string(name_rva)
+                    if name:
+                        imports.add(name)
+                at += stride
+        return PeInfo(bits, imports, subsystem == 2)
+    except (struct.error, IndexError):
+        return None
+
+
+@dataclass
+class Executable:
+    key: str
+    size: int
+    info: PeInfo
+    score: float
+
+
+def find_executables(source: Source, name: str = "") -> list[Executable]:
+    """The source's Windows programs, likeliest to be the game first."""
+    words = re.findall(r"[a-z0-9]+", name.lower())
+    # "Hades II" is Hades2.exe: the name with its Roman numerals as digits too
+    roman = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8", "ix": "9"}
+    names = {"".join(words), "".join(roman.get(word, word) for word in words)} - {""}
+    found = []
+    for key, size in source.files.items():
+        if not key.lower().endswith(".exe") or size < 1024:
+            continue
+        info = pe_info(source.read(key, limit=min(size, SCAN_LIMIT)))
+        if info is None:
+            continue
+        stem = re.sub(r"[^a-z0-9]", "", PurePosixPath(key).stem.lower())
+        score = min(size, 64 << 20) / (1 << 20)          # bigger is likelier, up to a point
+        score -= 25 * key.count("/")                      # the top folder is likelier
+        if NOT_THE_GAME.search(PurePosixPath(key).stem.lower()):
+            score -= 200
+        if not info.gui:
+            score -= 50
+        if stem and any(stem in wanted or wanted in stem for wanted in names):
+            score += 100
+        if info.bits == 64:
+            score += 10                                   # a game's 32-bit helpers sit beside it
+        if graphics_of(info.imports) or "d3d12.dll" in info.imports or "vulkan-1.dll" in info.imports:
+            # The console can't start a second program, so a launcher
+            # (Red Alert 2's RA2.exe before Game.exe) never gets anywhere;
+            # the exe that draws is the one to start
+            score += 120
+        found.append(Executable(key, size, info, score))
+    return sorted(found, key=lambda exe: (-exe.score, exe.key))
+
+
+def game_imports(source: Source, exe: Executable) -> set[str]:
+    """What the executable and the game's own DLLs import. Engines load
+    their renderer from a DLL (Half-Life's hw.dll, Source's
+    shaderapidx9.dll), so those count too. Read once per source."""
+    cache = source.__dict__.setdefault("_dll_imports", None)
+    if cache is None:
+        cache = set()
+        folder = posixpath.dirname(exe.key)
+        dlls = sorted((key for key in source.files if key.lower().endswith(".dll")),
+                      key=lambda key: (posixpath.dirname(key) != folder, key))
+        for key in dlls[:SCAN_DLLS]:
+            if source.files[key] > SCAN_LIMIT:
+                continue
+            info = pe_info(source.read(key))
+            if info:
+                cache.update(info.imports)
+        source._dll_imports = cache
+    return cache | exe.info.imports
+
+
+def graphics_of(imports: Iterable[str]) -> str | None:
+    imports = set(imports)
+    if any(D3D.match(name) for name in imports):
+        return "dxvk"
+    if "opengl32.dll" in imports:
+        return "opengl"
+    if "ddraw.dll" in imports:
+        return "auto"
+    return None
+
+
+def guess_graphics(source: Source, exe: Executable) -> str:
+    """dxvk for Direct3D 8-11, opengl, or gdi, from what the executable and
+    the game's own DLLs import. Direct3D wins over OpenGL: DXVK is the
+    backend every build has."""
+    direct = graphics_of(exe.info.imports)
+    if direct == "dxvk":
+        return direct
+    found = graphics_of(game_imports(source, exe))
+    if "dxvk" in (direct, found):
+        return "dxvk"
+    return direct or found or "gdi"
+
+
+def autoconfigure(source: Source, exe: Executable, exes: list[Executable]) -> tuple[Executable, Plan]:
+    """The executable to start and what it needs (tools/pw_autoconfig.py)."""
+    plan = pw_autoconfig.plan(source, exe, game_imports(source, exe), guess_graphics(source, exe))
+    better = next((other for other in exes if other.key == plan.exe), None)
+    if better is not None and better is not exe:
+        followed = pw_autoconfig.plan(source, better, game_imports(source, better),
+                                      guess_graphics(source, better))
+        followed.checks = [check for check in plan.checks if plan.exe in check.text] + followed.checks
+        return better, followed
+    return exe, plan
+
+
+# --- the game and its profile --------------------------------------------------
+def slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:64].strip("-")
+    return slug if SLUG.match(slug or "") else "game"
+
+
+@dataclass
+class Game:
+    name: str
+    slug: str
+    exe: str                       # inside the game's folder, posix
+    bits: int
+    graphics: str = "dxvk"
+    arguments: str = ""
+    desktop: str = "1920x1080"
+    scaling: str = "fit"
+    preset: str = ""
+    show_fps: bool = True
+    # Variables for the game's process, through the prefix's HKCU\Environment
+    # (Wine's ntdll adds them to every process), and the profile's Wine log
+    # channels ([debug] winedebug).
+    environment: dict[str, str] = field(default_factory=dict)
+    winedebug: str = ""
+    engine: str = ""
+    checks: list = field(default_factory=list)     # pw_autoconfig.Check
+    # A launcher (RA2.exe before Game.exe) the game starts through: the
+    # console can't start a second program, so pwexec runs the launcher and
+    # the program it starts, one after the other, in the one process (see
+    # tools/pwexec). The path is inside the game's folder, posix.
+    launcher: str = ""
+
+    @property
+    def uses_dxvk(self) -> bool:
+        return self.graphics in ("dxvk", "d3d12")
+
+    @property
+    def mono(self) -> bool:
+        return self.engine in MONO_ENGINES
+
+    def check(self) -> None:
+        if not SLUG.match(self.slug):
+            raise QuickError(f"{self.slug!r} is not a usable id: lower-case letters, digits and dashes")
+        if self.graphics not in GRAPHICS:
+            raise QuickError(f"graphics {self.graphics!r} is not one of {', '.join(GRAPHICS)}")
+        if self.scaling not in SCALING:
+            raise QuickError(f"scaling {self.scaling!r} is not one of {', '.join(SCALING)}")
+        if not re.fullmatch(r"\d{3,5}x\d{3,5}", self.desktop):
+            raise QuickError(f"desktop {self.desktop!r} is not WIDTHxHEIGHT")
+        if any(ch in self.name for ch in "\r\n") or any(ch in self.arguments for ch in "\r\n"):
+            raise QuickError("the name and arguments must be one line")
+        if self.preset and not re.fullmatch(r"[A-Za-z0-9_.-]+", self.preset):
+            raise QuickError(f"preset {self.preset!r} is not a preset file name")
+        for name, value in self.environment.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or any(ch in value for ch in "\r\n\0"):
+                raise QuickError(f"{name}={value} is not an environment variable")
+        if self.winedebug and not re.fullmatch(r"[A-Za-z0-9_+,.-]+", self.winedebug):
+            raise QuickError(f"{self.winedebug!r} is not a list of Wine log channels")
+
+    @property
+    def folder(self) -> str:
+        """Where the game's files go, in the prefix."""
+        return f"{GAMES}/{self.slug}"
+
+    def windows(self, key: str) -> str:
+        """A path in the prefix as the game sees it: C:\\Games\\..."""
+        parts = PurePosixPath(key).relative_to("drive_c").parts
+        return str(PureWindowsPath("C:\\", *parts))
+
+    def profile(self) -> str:
+        exe = f"{self.folder}/{self.exe}"
+        lines = [f"; {self.name}: generated by tools/pw_quick.py from the game's own files."]
+        if self.engine:
+            lines.append(f"; engine: {self.engine}")
+        lines += [f"; {check}" for check in self.checks]
+        if self.launcher:
+            # Start pwexec, beside the launcher, with the launcher as its
+            # first argument; it runs the launcher and the program the
+            # launcher starts in the one process.
+            pwexec = f"{posixpath.dirname(f'{self.folder}/{self.launcher}')}/{PWEXEC_NAMES[self.bits]}"
+            start = self.windows(pwexec)
+            work = self.windows(posixpath.dirname(f"{self.folder}/{self.launcher}"))
+            launcher_arg = PureWindowsPath(self.windows(f"{self.folder}/{self.launcher}")).name
+            arguments = f'"{launcher_arg}"' + (f" {self.arguments}" if self.arguments else "")
+        else:
+            start = self.windows(exe)
+            work = self.windows(posixpath.dirname(exe))
+            arguments = self.arguments
+        lines += [
+                 "[application]", f"id = {self.slug}", f"name = {self.name}",
+                 f"executable = {start}",
+                 f"working_directory = {work}"]
+        if arguments:
+            lines.append(f"arguments = {arguments}")
+        if self.graphics == "dxvk":
+            lines.append(f"dll_overrides = {','.join(DXVK_DLLS)}=n")
+        elif self.graphics == "d3d12":
+            lines.append(f"dll_overrides = {','.join(DXVK_DLLS)},d3d12,d3d12core=n")
+        elif self.graphics == "opengl":
+            # OpenGL draws through Mesa's Zink (v0.2.0): the app's native opengl32.
+            lines.append("dll_overrides = opengl32=n")
+        lines += [f"prefix = {self.slug}", "runtime = wine-wow64", f"architecture = pe{self.bits}",
+                  f"graphics = {'dxvk' if self.graphics == 'd3d12' else self.graphics}",
+                  "", "[display]", f"desktop = {self.desktop}", f"scaling = {self.scaling}"]
+        if not self.show_fps:
+            lines.append("show_fps = false")
+        if self.preset:
+            lines += ["", "[input]", f"preset = {self.preset}"]
+        if self.winedebug:
+            lines += ["", "[debug]", f"winedebug = {self.winedebug}"]
+        return "\n".join(lines) + "\n"
+
+
+def suggest(source: Source) -> tuple[Game, list[Executable]]:
+    """A first guess at the game's settings, and every executable it could be."""
+    name = re.sub(r"[_.]+", " ", source.name).strip() or "Game"
+    exes = find_executables(source, name)
+    if not exes:
+        raise QuickError(f"{source.path} has no Windows executable (.exe)")
+    exe, plan = autoconfigure(source, exes[0], exes)
+    return configured(source, exe, plan, name, exes), exes
+
+
+def _draws(exe: Executable) -> bool:
+    imports = exe.info.imports
+    return bool(graphics_of(imports) or "d3d12.dll" in imports or "vulkan-1.dll" in imports)
+
+
+def _is_tool(exe: Executable) -> bool:
+    """Setup, patcher, crash reporter, and the like. A program whose name says
+    it launches the game (LaunchGTAIV.exe) is the handoff, not one of these."""
+    stem = PurePosixPath(exe.key).stem.lower()
+    if re.search(r"launch|start", stem):
+        return False
+    return bool(NOT_THE_GAME.search(stem))
+
+
+def launch_pair(exe: Executable, exes: list[Executable]) -> tuple[Executable, str]:
+    """The game to configure, and the launcher it is started through (or "").
+
+    Same folder, same architecture, windowed. The program that imports a
+    graphics library is the game; a sibling that draws nothing is the
+    launcher (RA2.exe before Game.exe). Either one may be the exe that was
+    picked. Setup programs stay out of the pair."""
+    def eligible(other: Executable) -> bool:
+        return (other.key != exe.key
+                and posixpath.dirname(other.key) == posixpath.dirname(exe.key)
+                and other.info.bits == exe.info.bits
+                and other.info.gui
+                and not _is_tool(other))
+
+    siblings = [other for other in exes if eligible(other)]
+    if _is_tool(exe):
+        return exe, ""
+    if _draws(exe):
+        quiet = [other for other in siblings if not _draws(other)]
+        best = max(quiet, key=lambda other: other.score, default=None)
+        return exe, (best.key if best else "")
+    drawing = [other for other in siblings if _draws(other)]
+    best = max(drawing, key=lambda other: other.score, default=None)
+    if best is None:
+        return exe, ""
+    return best, exe.key
+
+
+def configured(source: Source, exe: Executable, plan: pw_autoconfig.Plan, name: str,
+               exes: list[Executable] | None = None) -> Game:
+    environment = suggest_environment(source)
+    environment.update(plan.environment)
+    # Unreal and Ren'Py name the real program and start it directly. Every
+    # other game, including .NET and XNA, can still be handed off by a launcher.
+    if plan.exe:
+        game_exe, launcher = exe, ""
+    else:
+        game_exe, launcher = launch_pair(exe, exes if exes is not None else find_executables(source, name))
+        if game_exe is not exe:
+            # Graphics, engine and checks come from the game, not the launcher.
+            plan = pw_autoconfig.plan(source, game_exe, game_imports(source, game_exe),
+                                      guess_graphics(source, game_exe))
+            environment = suggest_environment(source)
+            environment.update(plan.environment)
+            if plan.exe:
+                launcher = ""
+    if launcher:
+        base = posixpath.basename(launcher)
+        plan.checks = [pw_autoconfig.Check(
+            pw_autoconfig.OK,
+            f"starts through {base}: the console can't start a second program, "
+            f"so {base} and the game run one after the other")] + list(plan.checks)
+    return Game(name=name, slug=slugify(name), exe=game_exe.key, bits=game_exe.info.bits,
+                graphics=plan.graphics or guess_graphics(source, game_exe), arguments=" ".join(plan.arguments),
+                environment=environment, engine=plan.engine, checks=plan.checks, launcher=launcher)
+
+
+# .NET's runtime (Godot's C# builds, MonoGame, ...) starts by reserving
+# address space for its garbage collector: 256 GB or more since .NET 7. The
+# console refuses reservations much past 4 GB (ProbeTris: 4 GB reserved, 16 GB
+# refused), and reports about 512 MB of RAM with none free, which the GC sizes
+# itself from. A Godot C# game froze right after coreclr.dll started. These
+# cap the GC's reservation and heap at sizes the console grants. W^X (the
+# writable and executable double mapping of generated code, on since .NET 7)
+# goes off too: one less mapping trick for the console's Wine.
+DOTNET = {
+    "DOTNET_GCRegionRange": "0xC0000000",      # 3 GB of address space for the GC
+    "DOTNET_GCHeapHardLimit": "0x80000000",    # 2 GB of heap
+    "DOTNET_EnableWriteXorExecute": "0",
+}
+
+
+def suggest_environment(source: Source) -> dict[str, str]:
+    names = {posixpath.basename(key).lower() for key in source.files}
+    return dict(DOTNET) if "coreclr.dll" in names else {}
+
+
+def parse_environment(text: str) -> dict[str, str]:
+    """NAME=VALUE pairs separated by ';' or new lines."""
+    out = {}
+    for item in re.split(r"[;\n]", text):
+        if item.strip():
+            name, sep, value = item.strip().partition("=")
+            if not sep:
+                raise QuickError(f"{item.strip()!r} is not NAME=VALUE")
+            out[name.strip()] = value.strip()
+    return out
+
+
+def format_environment(environment: dict[str, str]) -> str:
+    return "; ".join(f"{name}={value}" for name, value in environment.items())
+
+
+def set_environment(user_reg: bytes, environment: dict[str, str]) -> bytes:
+    """user.reg with these values in HKCU\\Environment (made if missing)."""
+    return set_values(user_reg, "Environment", environment)
+
+
+def set_values(user_reg: bytes, key: str, values: dict[str, str]) -> bytes:
+    """user.reg with these string values in HKCU\\key (made if missing)."""
+    if not values:
+        return user_reg
+    def quote(text: str) -> str:
+        text = text.replace("\\", "\\\\").replace('"', '\\"')
+        # Wine's .reg files spell what isn't ASCII as \xXXXX
+        return '"' + "".join(ch if ord(ch) < 0x80 else f"\\x{ord(ch):04x}" for ch in text) + '"'
+    header = "[" + key.replace("\\", "\\\\") + "]"
+    lines = user_reg.decode("utf-8", "surrogateescape").split("\n")
+    start = next((i for i, line in enumerate(lines)
+                  if line.lower() == header.lower() or line.lower().startswith(header.lower() + " ")), None)
+    if start is None:
+        if lines and lines[-1] == "":
+            lines.pop()
+        lines += ["", f"{header} 0"]
+        start = len(lines) - 1
+        lines.append("")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    names = {quote(name).lower() for name in values}
+    body = [line for line in lines[start + 1:end]
+            if line.split("=", 1)[0].lower() not in names and line != ""]
+    body += [f"{quote(name)}={quote(value)}" for name, value in values.items()]
+    lines[start + 1:end] = body + [""]
+    return "\n".join(lines).encode("utf-8", "surrogateescape")
+
+
+
+# .reg files the game folder carries (a CD key exported from the PC's
+# registry, say) go into the game's own registry: HKLM and HKCR into
+# system.reg, HKCU into user.reg. Windows' .reg format and Wine's are
+# nearly the same; only the key headers and non-ASCII text differ.
+REG_LIMIT = 4 * 1024 * 1024
+REG_HIVES = {
+    "hkey_local_machine": ("system.reg", ""), "hklm": ("system.reg", ""),
+    "hkey_classes_root": ("system.reg", "Software\\Classes"), "hkcr": ("system.reg", "Software\\Classes"),
+    "hkey_current_user": ("user.reg", ""), "hkcu": ("user.reg", ""),
+    "hkey_users\\.default": ("user.reg", ""),
+}
+
+
+def reg_text(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", "replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", "replace")
+
+
+def reg_name(line: str) -> str | None:
+    """The value name a .reg line sets, lower-cased, '@' for the default."""
+    if line.startswith("@"):
+        return "@"
+    if not line.startswith('"'):
+        return None
+    i, out = 1, []
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            out.append(line[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            return "".join(out).lower()
+        out.append(ch)
+        i += 1
+    return None
+
+
+def ascii_reg(line: str) -> str:
+    return "".join(ch if ord(ch) < 0x80 else f"\\x{ord(ch):04x}" for ch in line)
+
+
+def parse_reg(data: bytes) -> list[tuple[str, str, list[str] | None]]:
+    """(registry file, key, value lines or None to delete the key) for each
+    key a .reg file names, in order. Keys outside the hives above are left out."""
+    lines, joined = reg_text(data).replace("\r\n", "\n").replace("\r", "\n").split("\n"), []
+    for line in lines:
+        if joined and joined[-1].endswith("\\") and not joined[-1].lstrip().startswith("["):
+            joined[-1] = joined[-1][:-1] + line.strip()
+        else:
+            joined.append(line.strip())
+    out: list[tuple[str, str, list[str] | None]] = []
+    current = None
+    for line in joined:
+        if line.startswith("[") and line.endswith("]"):
+            current = None
+            path, delete = line[1:-1], False
+            if path.startswith("-"):
+                path, delete = path[1:], True
+            lower = path.lower()
+            for hive, (file, prefix) in sorted(REG_HIVES.items(), key=lambda item: -len(item[0])):
+                if lower == hive or lower.startswith(hive + "\\"):
+                    rest = path[len(hive) + 1:]
+                    key = "\\".join(part for part in (prefix, rest) if part)
+                    if key:
+                        current = (file, key, None if delete else [])
+                        out.append(current)
+                    break
+            continue
+        if current is not None and current[2] is not None and reg_name(line) is not None and "=" in line:
+            current[2].append(ascii_reg(line))
+    return out
+
+
+def wine_header(key: str) -> str:
+    return "[" + key.replace("\\", "\\\\") + "]"
+
+
+def merge_reg(registry: bytes, key: str, values: list[str] | None) -> bytes:
+    """A Wine registry file with these .reg value lines in key, made if
+    missing; a value line ending '=-' removes the value, and values None
+    removes the key with everything under it."""
+    header = wine_header(key).lower()
+    lines = registry.decode("utf-8", "surrogateescape").split("\n")
+
+    def sections(match):
+        found, i = [], 0
+        while i < len(lines):
+            if lines[i].startswith("[") and match(lines[i].lower().split("]", 1)[0] + "]"):
+                end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith("[")), len(lines))
+                found.append((i, end))
+                i = end
+            else:
+                i += 1
+        return found
+
+    if values is None:
+        below = header[:-1] + "\\\\"
+        for start, end in reversed(sections(lambda h: h == header or h.startswith(below))):
+            del lines[start:end]
+        return "\n".join(lines).encode("utf-8", "surrogateescape")
+    found = sections(lambda h: h == header)
+    if not found:
+        if lines and lines[-1] == "":
+            lines.pop()
+        lines += ["", f"{wine_header(key)} {int(time.time())}", ""]
+        start, end = len(lines) - 2, len(lines)
+    else:
+        start, end = found[0]
+    body = [line for line in lines[start + 1:end] if line != ""]
+    for line in values:
+        name = reg_name(line)
+        body = [old for old in body if reg_name(old) != name]
+        if not line.endswith("=-"):
+            body.append(line)
+    lines[start + 1:end] = body + [""]
+    return "\n".join(lines).encode("utf-8", "surrogateescape")
+
+
+def apply_reg(registry: bytes, file: str, entries, bits: int = 64) -> bytes:
+    """registry (system.reg or user.reg) with the parse_reg entries for it.
+    A 32-bit game reads HKLM\\Software through Wow6432Node, so what a .reg
+    file puts straight in HKLM\\Software is put there as well."""
+    for target, key, values in entries:
+        if target != file:
+            continue
+        registry = merge_reg(registry, key, values)
+        lower = key.lower()
+        if (bits == 32 and file == "system.reg" and lower.startswith("software\\")
+                and not lower.startswith(("software\\wow6432node", "software\\classes"))):
+            registry = merge_reg(registry, "Software\\Wow6432Node\\" + key[len("software\\"):], values)
+    return registry
+
+# Fonts the console lacks (ProbeTris locale.fonts.missing), drawn with the
+# metric-compatible ones tools/pw_base_prefix.py --fonts adds, through
+# Wine's HKCU\Software\Wine\Fonts\Replacements.
+FONT_KEY = "Software\\Wine\\Fonts\\Replacements"
+FONT_REPLACEMENTS = {
+    "LiberationSans-Regular.ttf": {
+        "Arial": "Liberation Sans", "Helvetica": "Liberation Sans", "Verdana": "Liberation Sans",
+        "Segoe UI": "Liberation Sans", "Microsoft Sans Serif": "Liberation Sans", "MS Sans Serif": "Liberation Sans",
+        "Trebuchet MS": "Liberation Sans", "Calibri": "Liberation Sans"},
+    "LiberationSerif-Regular.ttf": {"Times New Roman": "Liberation Serif", "Georgia": "Liberation Serif",
+                                    "Cambria": "Liberation Serif"},
+    "LiberationMono-Regular.ttf": {"Courier New": "Liberation Mono", "Consolas": "Liberation Mono",
+                                   "Lucida Console": "Liberation Mono"},
+    "ipag.ttf": {name: "IPAGothic" for name in (
+        "MS Gothic", "MS PGothic", "MS UI Gothic", "Meiryo", "Meiryo UI", "Yu Gothic",
+        "\uff2d\uff33 \u30b4\u30b7\u30c3\u30af", "\uff2d\uff33 \uff30\u30b4\u30b7\u30c3\u30af")},
+}
+
+
+def font_replacements(base: Source) -> dict[str, str]:
+    """The replacements for the fonts the base prefix brings."""
+    have = {posixpath.basename(key).lower() for key in base.files if key.lower().startswith("drive_c/windows/fonts/")}
+    out: dict[str, str] = {}
+    for font, names in FONT_REPLACEMENTS.items():
+        if font.lower() in have:
+            out.update(names)
+    return out
+
+
+# --- DXVK ------------------------------------------------------------------------
+def dxvk_files(archive: Path, version: str = DXVK_VERSION) -> dict[str, bytes]:
+    """The prefix's DXVK DLLs from a release tarball: x64 in system32, x32 in syswow64."""
+    out = {}
+    with tarfile.open(archive) as release:
+        for bits, folder in (("x64", "system32"), ("x32", "syswow64")):
+            for dll in DXVK_DLLS:
+                member = release.extractfile(f"dxvk-{version}/{bits}/{dll}.dll")
+                if member is None:
+                    raise QuickError(f"{archive} has no {bits}/{dll}.dll")
+                out[f"drive_c/windows/{folder}/{dll}.dll"] = member.read()
+    return out
+
+
+def fetch_dxvk(version: str = DXVK_VERSION) -> Path:
+    """The pinned DXVK release, downloaded once and checked by its hash."""
+    import pw_install
+    url, digest = pw_install.dxvk_release(version)
+    try:
+        return pw_install.fetch(url, digest, f"dxvk-{version}.tar.gz")
+    except (OSError, pw_install.InstallError) as error:
+        raise QuickError(f"could not get DXVK {version}: {error}") from error
+
+
+# --- sending ---------------------------------------------------------------------
+@dataclass
+class Item:
+    key: str                                       # in the prefix
+    size: int
+    open: Callable[[], object] | None = None       # a stream
+    data: bytes | None = None                      # or the bytes themselves
+    always: bool = False                           # changed on the way: send even at the same size
+
+
+@dataclass
+class Progress:
+    done_bytes: int = 0
+    total_bytes: int = 0
+    done_files: int = 0
+    total_files: int = 0
+    current: str = ""
+    skipped: int = 0
+    message: str = ""
+    log: list[str] = field(default_factory=list)
+    connections: int = 1      # FTP connections sending at once
+    # What each connection is sending now, by connection: Sender.each's lanes
+    active: dict[int, str] = field(default_factory=dict)
+
+
+class CountingReader:
+    """A stream read CHUNK at a time, counted, and stopped when cancelled."""
+
+    def __init__(self, stream, tick: Callable[[int], None], cancel: threading.Event):
+        self.stream, self.tick, self.cancel, self.size = stream, tick, cancel, 0
+
+    def read(self, size: int = -1) -> bytes:
+        if self.cancel.is_set():
+            raise Cancelled()
+        data = self.stream.read(CHUNK if size is None or size < 0 or size > CHUNK else size)
+        self.size += len(data)
+        self.tick(len(data))
+        return data
+
+
+class Sender:
+    """Puts one game on the console: its prefix, its profile, its launcher entry."""
+
+    def __init__(self, remote, game: Game, source: Source, base: Source,
+                 dxvk: dict[str, bytes] | None = None, cpu_dll: bytes | None = None,
+                 remote_root: str = REMOTE_ROOT, state_dir: Path = STATE_DIR, host: str = "console",
+                 report: Callable[[Progress], None] | None = None, cancel: threading.Event | None = None,
+                 mono: Source | None = None, lanes: int = FTP_LANES):
+        game.check()
+        if game.mono and mono is None:
+            raise QuickError(f"{game.name} needs Wine Mono, and {MONO_NAME}.zip isn't next to the sender")
+        if game.exe not in source.files:
+            raise QuickError(f"{game.exe} is not in {source.path}")
+        if "system.reg" not in base.files or "user.reg" not in base.files:
+            raise QuickError(f"{base.path} is not a base prefix: it has no system.reg and user.reg")
+        if BASE_LINKS not in base.files:
+            raise QuickError(f"{base.path} has no {BASE_LINKS}: make the base prefix with "
+                             "tools/pw_base_prefix.py, which keeps Wine's links the way the console reads them")
+        if game.uses_dxvk and not dxvk:
+            raise QuickError("the game uses DXVK, and no DXVK DLLs were given")
+        self.remote, self.game, self.source, self.base = remote, game, source, base
+        self.mono = mono if game.mono else None
+        self.dxvk, self.cpu_dll = (dxvk or {}) if game.uses_dxvk else {}, cpu_dll
+        self.root = remote_root.rstrip("/")
+        self.remote_prefix = f"{self.root}/prefixes/{game.slug}"
+        self.remote_mono = f"{self.root}/shared/{MONO_NAME}"
+        self.state_path = Path(state_dir) / f"{re.sub(r'[^A-Za-z0-9.-]', '_', host)}-{game.slug}.json"
+        self.progress = Progress()
+        self.report = report or (lambda progress: None)
+        self.cancel = cancel or threading.Event()
+        self.lanes = max(1, lanes)
+        self.lock = threading.RLock()
+        self.spares: list = []    # the connections beside self.remote, opened by each()
+
+    def say(self, message: str) -> None:
+        self.progress.message = message
+        self.progress.log.append(message)
+        self.report(self.progress)
+
+    # what goes where
+    def items(self) -> tuple[list[Item], set[str]]:
+        items: dict[str, Item] = {}
+        dirs = set(self.base.dirs)
+        for key, size in self.base.files.items():
+            if key in REGISTRY:
+                data = self.base.read(key)
+                data = apply_reg(data, key, self.reg_entries(), self.game.bits)
+                if key == "user.reg":
+                    data = set_environment(data, self.environment())
+                    data = set_values(data, FONT_KEY, font_replacements(self.base))
+                    if self.mono is not None:
+                        runtime = "Z:" + self.remote_mono.replace("/", "\\")
+                        data = set_values(data, MONO_KEY, {"RuntimePath": runtime})
+                data = to_console(key, data)
+                items[key] = Item(key, len(data), data=data)
+            else:
+                items[key] = Item(key, size, open=lambda key=key: self.base.open(key))
+        folder = self.game.folder
+        dirs.update(posixpath.join(folder, d) for d in self.source.dirs)
+        dirs.add(folder)
+        for key, size in self.source.files.items():
+            target = f"{folder}/{key}"
+            data = None
+            if key.lower().endswith((".exe", ".dll")) and size <= UNSHARE_LIMIT:
+                header = self.source.read(key, 4096)
+                if unshared(header) is not None:
+                    data = unshared(self.source.read(key))
+            if data is not None:
+                self.say(f"{key}: made its shared sections private (the console can't map them)")
+                items[target] = Item(target, len(data), data=data, always=True)
+            else:
+                items[target] = Item(target, size, open=lambda key=key: self.source.open(key))
+        for key, data in self.stand_ins().items():
+            if posixpath.basename(key) in D3D12_FILES:
+                self.say(f"{posixpath.basename(key)}: Direct3D 12 through vkd3d-proton, beside the game")
+            else:
+                self.say(f"{posixpath.basename(key)}: a stand-in, because the game names it and doesn't ship it")
+            items[key] = Item(key, len(data), data=data)
+        for key, data in self.dxvk.items():
+            items[key] = Item(key, len(data), data=data)
+        if self.cpu_dll is not None:
+            items[CPU_DLL] = Item(CPU_DLL, len(self.cpu_dll), data=self.cpu_dll)
+        for item in items.values():
+            parent = posixpath.dirname(item.key)
+            while parent:
+                dirs.add(parent)
+                parent = posixpath.dirname(parent)
+        return sorted(items.values(), key=lambda item: item.key), dirs
+
+    def environment(self) -> dict[str, str]:
+        """The game's variables, with the Direct3D 12 proxy's RAM floor for a
+        d3d12 game unless the game's settings name it."""
+        if self.game.graphics == "d3d12":
+            return {**D3D12_ENVIRONMENT, **self.game.environment}
+        return dict(self.game.environment)
+
+    def reg_entries(self) -> list:
+        """What the .reg files in the game's folder put in the registry."""
+        entries = getattr(self, "_reg_entries", None)
+        if entries is None:
+            entries = []
+            for key, size in sorted(self.source.files.items()):
+                if key.lower().endswith(".reg") and size <= REG_LIMIT:
+                    try:
+                        found = parse_reg(self.source.read(key))
+                    except (OSError, KeyError, UnicodeError):
+                        continue
+                    if found:
+                        self.say(f"{key}: put in the game's registry")
+                        entries += found
+            self._reg_entries = entries
+        return entries
+
+    def stand_ins(self) -> dict[str, bytes]:
+        """Files the sender adds beside the game's exe, by prefix path: the
+        Direct3D 12 proxy and vkd3d-proton for a d3d12 game, and
+        STUB_ASSEMBLIES the exe names and its folder lacks."""
+        found = {}
+        if self.game.graphics == "d3d12":
+            here = posixpath.dirname(f"{self.game.folder}/{self.game.exe}")
+            for name in D3D12_FILES:
+                if not (D3D12_DIR / name).is_file():
+                    raise QuickError(f"{name} isn't in {D3D12_DIR}: this sender build lacks Direct3D 12")
+                found[f"{here}/{name}"] = (D3D12_DIR / name).read_bytes()
+        if self.game.launcher:
+            name = PWEXEC_NAMES[self.game.bits]
+            pwexec = PWEXEC_DIR / name
+            if not pwexec.is_file():
+                raise QuickError(f"{name} isn't in {PWEXEC_DIR}: this sender build lacks the launcher loader")
+            here = posixpath.dirname(f"{self.game.folder}/{self.game.launcher}")
+            found[f"{here}/{name}"] = pwexec.read_bytes()
+        if self.mono is None:
+            return found
+        try:
+            exe = self.source.read(self.game.exe, SCAN_LIMIT)
+        except (OSError, KeyError):
+            return {}
+        here = posixpath.dirname(self.game.exe)
+        present = {key.lower() for key in self.source.files}
+        for name in STUB_ASSEMBLIES:
+            dll = posixpath.join(here, f"{name}.dll")
+            stub = STUBS / f"{name}.dll"
+            if b"\0" + name.encode() + b"\0" in exe and dll.lower() not in present and stub.is_file():
+                found[f"{self.game.folder}/{dll}"] = stub.read_bytes()
+        return found
+
+    def load_state(self) -> tuple[dict[str, int] | None, bool]:
+        """The files this PC sent the console, and whether that send finished."""
+        try:
+            state = json.loads(self.state_path.read_text())
+            return {key: int(size) for key, size in state["files"].items()}, bool(state.get("complete"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None, False
+
+    def save_state(self, files: dict[str, int], complete: bool = False) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.state_path.with_name(self.state_path.name + ".tmp")
+        partial.write_text(json.dumps({"slug": self.game.slug, "complete": complete, "files": files},
+                                      indent=1, sort_keys=True))
+        os.replace(partial, self.state_path)
+
+    def send(self, overwrite: bool = False) -> None:
+        """Sends what the console does not have yet. A send that stopped part
+        way carries on; a finished one, or a copy from elsewhere, is only
+        replaced with overwrite, since the console's copy holds the saves."""
+        state, complete = self.load_state()
+        on_console = self.remote.exists(self.remote_prefix)
+        if not on_console:
+            # Deleted from the console since: what this PC sent is gone too.
+            state, complete = None, False
+        if not overwrite and on_console:
+            if state is None:
+                raise NeedsOverwrite(f"the console already has {self.game.slug}, sent from somewhere else. "
+                                     "Replacing it loses its saves and settings there.")
+            if complete:
+                raise NeedsOverwrite(f"{self.game.slug} is already on the console. Sending it again "
+                                     "replaces its saves and settings there.")
+        if overwrite and state is not None:
+            # The game's files this PC sent at the same size stay; the
+            # registry, which holds the settings, goes again.
+            state = {key: size for key, size in state.items() if key not in REGISTRY}
+        try:
+            self.send_files(state)
+        finally:
+            self.close_spares()
+
+    def send_files(self, state: dict[str, int] | None) -> None:
+        self.put_mono()
+        if self.cpu_dll is None and BUNDLED_CPU_DLL.is_file():
+            self.cpu_dll = BUNDLED_CPU_DLL.read_bytes()
+        if self.cpu_dll is None and self.remote.size(f"{self.remote_prefix}/{CPU_DLL}") is None:
+            self.cpu_dll = fetch_app_cpu_dll(self.remote)
+        items, dirs = self.items()
+        state = dict(state or {})
+        self.progress.total_files = len(items)
+        self.progress.total_bytes = sum(item.size for item in items)
+        self.say(f"making {len(dirs)} folders")
+        levels: dict[int, list[str]] = {}
+        for directory in dirs:
+            levels.setdefault(directory.count("/"), []).append(directory)
+        for depth in sorted(levels):
+            # A level's parents are all made before it starts.
+            self.each(sorted(levels[depth]), lambda directory, remote: self.retrying(
+                lambda: remote.makedirs(f"{self.remote_prefix}/{directory}"), remote))
+        self.say(f"sending {len(items)} files ({pw_prefix.gib(self.progress.total_bytes)})")
+        todo = []
+        for item in items:
+            # What this PC already sent at this size is there.
+            if state.get(item.key) == item.size and not item.always:
+                self.progress.skipped += 1
+                self.advance(item.size)
+            else:
+                todo.append(item)
+        unsaved = 0
+
+        def send_one(item: Item, remote) -> None:
+            nonlocal unsaved
+            self.progress.current = self.progress.active[id(remote)] = item.key
+            self.retrying(lambda: self.put(item, remote), remote)
+            self.progress.active.pop(id(remote), None)
+            with self.lock:
+                state[item.key] = item.size
+                unsaved += 1
+                if unsaved >= pw_prefix.SAVE_EVERY_FILES:
+                    self.save_state(dict(state))
+                    unsaved = 0
+        try:
+            # The biggest first, so the connections finish together.
+            self.each(sorted(todo, key=lambda item: -item.size), send_one)
+        except BaseException:
+            with self.lock:
+                self.save_state(dict(state))
+            raise
+        self.put_profile()
+        self.save_state(state, complete=True)
+        self.progress.current = ""
+        self.say(f"{self.game.name} is on the console: start prospero-win and pick it in the launcher")
+
+    def update_settings(self) -> None:
+        """Rewrites only the game's profile (program, graphics, arguments,
+        resolution, preset), plus DXVK's DLLs if it now needs them and the
+        console lacks them, and Wine Mono with the registry value pointing at
+        it for a .NET Framework game. The game's files and saves stay as
+        they are."""
+        if not self.remote.exists(self.remote_prefix):
+            raise QuickError(f"{self.game.slug} is not on the console yet: send it first")
+        if self.mono is not None:
+            try:
+                self.put_mono()
+            finally:
+                self.close_spares()
+        for name in ("system.reg", "user.reg"):
+            entries = [entry for entry in self.reg_entries() if entry[0] == name]
+            if name == "system.reg" and not entries:
+                continue
+            path = f"{self.remote_prefix}/{name}"
+            registry = self.remote.read(path)
+            changed = apply_reg(registry, name, entries, self.game.bits)
+            if name == "user.reg":
+                changed = set_environment(changed, self.environment())
+            if name == "user.reg" and self.mono is not None:
+                runtime = "Z:" + self.remote_mono.replace("/", "\\")
+                changed = set_values(changed, MONO_KEY, {"RuntimePath": runtime})
+            if changed != registry:
+                self.retrying(lambda path=path, changed=changed: self.remote.write(path, changed))
+        extra = {**self.stand_ins(), **self.dxvk}
+        if self.cpu_dll is None and BUNDLED_CPU_DLL.is_file():
+            extra[CPU_DLL] = BUNDLED_CPU_DLL.read_bytes()
+        for item in (Item(key, len(data), data=data) for key, data in sorted(extra.items())):
+            if self.remote.size(f"{self.remote_prefix}/{item.key}") != item.size:
+                self.say(f"sending {item.key}")
+                self.put(item)
+        self.put_profile()
+        self.say(f"{self.game.name}'s settings are updated on the console")
+
+    def check_cancel(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    def advance(self, size: int, files: int = 1) -> None:
+        with self.lock:
+            self.progress.done_bytes += size
+            self.progress.done_files += files
+        self.report(self.progress)
+
+    def each(self, tasks: Iterable, work: Callable[[object, object], None]) -> None:
+        """Runs work(task, remote) for every task, over up to self.lanes FTP
+        connections at once (more connections to the console, beside
+        self.remote, when it has clone)."""
+        tasks = list(tasks)
+        wanted = min(self.lanes, len(tasks)) - 1
+        if wanted > len(self.spares) and hasattr(self.remote, "clone"):
+            while len(self.spares) < wanted:
+                try:
+                    self.spares.append(self.remote.clone())
+                except (OSError, EOFError, ftplib.Error):
+                    self.lanes = len(self.spares) + 1  # the console takes fewer: use what it gave
+                    break
+        remotes = [self.remote, *self.spares[:max(wanted, 0)]]
+        self.progress.connections = len(remotes)
+        if len(remotes) == 1:
+            for task in tasks:
+                self.check_cancel()
+                work(task, self.remote)
+            self.progress.active.clear()
+            return
+        pending, taking, errors = iter(tasks), threading.Lock(), []
+
+        def lane(remote) -> None:
+            while not errors:
+                with taking:
+                    task = next(pending, taking)
+                if task is taking:
+                    return
+                try:
+                    self.check_cancel()
+                    work(task, remote)
+                except BaseException as error:  # noqa: B036 - handed to the caller's thread
+                    errors.append(error)
+                    return
+        threads = [threading.Thread(target=lane, args=(remote,), daemon=True) for remote in remotes]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.progress.active.clear()
+        if errors:
+            # A real failure over the Cancelled it made the other lanes stop with
+            raise next((error for error in errors if not isinstance(error, Cancelled)), errors[0])
+
+    def close_spares(self) -> None:
+        for remote in self.spares:
+            try:
+                remote.close()
+            except (OSError, EOFError, ftplib.Error):
+                pass
+        self.spares = []
+
+    def retrying(self, step: Callable[[], None], remote=None) -> None:
+        """Runs step, and when the console stops answering or drops the
+        connection, connects remote (self.remote by default) again and
+        repeats it, waiting longer each time."""
+        remote = remote or self.remote
+        for attempt in range(1, FTP_ATTEMPTS + 1):
+            try:
+                step()
+                return
+            except ftplib.error_perm:
+                raise
+            except (OSError, EOFError, ftplib.Error) as error:
+                if attempt == FTP_ATTEMPTS:
+                    raise QuickError(f"the PS5 stopped answering ({error or type(error).__name__}) "
+                                     f"{attempt} times: press Send again to carry on") from error
+                self.say(f"the PS5 is slow to answer ({error or type(error).__name__}): "
+                         f"connecting again (try {attempt + 1} of {FTP_ATTEMPTS})")
+                if self.cancel.wait(min(5 * attempt, 30)):
+                    raise Cancelled() from error
+                try:
+                    remote.reconnect()
+                except (OSError, EOFError, ftplib.Error):
+                    pass  # the next try fails and waits again
+
+    def put_mono(self) -> None:
+        """Wine Mono on the console, once for every game that needs it."""
+        if self.mono is None or self.remote.size(f"{self.remote_mono}/{MONO_MARKER}") is not None:
+            return
+        files = sorted(self.mono.files.items())
+        self.say(f"putting Wine Mono on the PS5 once ({len(files)} files, "
+                 f"{sum(size for _, size in files) / (1 << 20):.0f} MB)")
+        for directory in sorted({posixpath.dirname(key) for key, _ in files} | set(self.mono.dirs)):
+            self.check_cancel()
+            self.retrying(lambda: self.remote.makedirs(posixpath.join(self.remote_mono, directory)))
+        done = 0
+
+        def put_one(file: tuple[str, int], remote) -> None:
+            nonlocal done
+            key, size = file
+            target = f"{self.remote_mono}/{key}"
+            if remote.size(target) != size:
+                self.progress.active[id(remote)] = f"Wine Mono: {key}"
+                data = self.mono.read(key)
+                self.retrying(lambda: remote.write(target, data), remote)
+            with self.lock:
+                done += 1
+                if done % 50 == 0:
+                    self.say(f"Wine Mono: {done} of {len(files)} files")
+        self.each(files, put_one)
+        self.remote.write(f"{self.remote_mono}/{MONO_MARKER}", MONO_VERSION.encode())
+
+    def put(self, item: Item, remote=None) -> None:
+        """Sends one file over remote (self.remote by default). The progress
+        it made is taken back when it fails, for the retry to count again."""
+        remote = remote or self.remote
+        target = f"{self.remote_prefix}/{item.key}"
+        sent = 0
+
+        def tick(count: int) -> None:
+            nonlocal sent
+            with self.lock:
+                sent += count
+                self.progress.done_bytes += count
+            self.report(self.progress)
+        try:
+            if item.data is not None:
+                remote.write(target, item.data)
+            else:
+                with item.open() as stream:
+                    remote.write_stream(target, CountingReader(stream, tick, self.cancel))
+            stored = remote.size(target)
+            if stored != item.size:
+                raise QuickError(f"{target}: the console stored {stored} bytes, not {item.size}")
+        except BaseException:
+            with self.lock:
+                self.progress.done_bytes -= sent
+            raise
+        self.advance(item.size - sent)
+
+    def put_preset(self) -> None:
+        """The game's controller preset, from tools/presets, when the console lacks it."""
+        if not self.game.preset:
+            return
+        bundled = PRESETS / f"{self.game.preset}.input"
+        target = f"{self.root}/input/{self.game.preset}.input"
+        if bundled.is_file() and self.remote.size(target) is None:
+            self.remote.makedirs(f"{self.root}/input")
+            self.remote.write(target, bundled.read_bytes())
+            self.say(f"added the {self.game.preset} controller preset to the console")
+
+    def put_profile(self) -> None:
+        self.put_preset()
+        profiles = f"{self.root}/profiles"
+        name = f"{self.game.slug}.profile"
+        self.remote.makedirs(profiles)
+        self.remote.write(f"{profiles}/{name}", self.game.profile().encode("utf-8"))
+        # The launcher lists profiles.lst's order when there is one
+        # (native/pw_wine_library.c), so a game must be in it to show.
+        listing = f"{profiles}/profiles.lst"
+        if self.remote.size(listing) is not None:
+            lines = self.remote.read(listing).decode("latin-1").splitlines()
+            if name not in (line.strip() for line in lines):
+                lines = [line for line in lines if line.strip()] + [name]
+                self.remote.write(listing, ("\n".join(lines) + "\n").encode("latin-1"))
+
+
+def fetch_app_cpu_dll(remote) -> bytes:
+    """wowprospero.dll from the app on the console, which 32-bit games need in their prefix."""
+    if remote.size(APP_CPU_DLL) is None:
+        raise QuickError(f"the console has no {APP_CPU_DLL}: install the prospero-win app first")
+    return remote.read(APP_CPU_DLL)
+
+
+# --- the app itself --------------------------------------------------------------
+def install_app(remote, release: Source, report: Callable[[Progress], None] | None = None,
+                cancel: threading.Event | None = None) -> None:
+    """Uploads the release's PPSA99995 folder to /data/homebrew and marks its
+    eboot.bin and modules executable, which some FTP servers do not do."""
+    report = report or (lambda progress: None)
+    cancel = cancel or threading.Event()
+    files = dict(release.files)
+    if "PPSA99995/eboot.bin" in files:
+        strip = "PPSA99995/"
+    elif "eboot.bin" in files:
+        strip = ""
+    else:
+        raise QuickError(f"{release.path} is not a prospero-win release: no PPSA99995/eboot.bin")
+    progress = Progress(total_files=len(files), total_bytes=sum(files.values()))
+    keys = sorted(key for key in files if key.startswith(strip))
+    dirs = {posixpath.dirname(key[len(strip):]) for key in keys}
+    for directory in sorted(dirs):
+        remote.makedirs(f"{APP_ROOT}/{directory}" if directory else APP_ROOT)
+    executable = []
+    for key in keys:
+        if cancel.is_set():
+            raise Cancelled()
+        relative = key[len(strip):]
+        target = f"{APP_ROOT}/{relative}"
+        progress.current = relative
+        report(progress)
+
+        def tick(count: int) -> None:
+            progress.done_bytes += count
+            report(progress)
+        with release.open(key) as stream:
+            remote.write_stream(target, CountingReader(stream, tick, cancel))
+        if remote.size(target) != files[key]:
+            raise QuickError(f"{target}: the console stored a different size")
+        progress.done_files += 1
+        if relative == "eboot.bin" or relative.endswith(".prx"):
+            executable.append(target)
+    chmod = getattr(remote, "chmod", None)
+    refused = 0
+    for target in executable:
+        if chmod and not chmod(target, "755"):
+            refused += 1
+    progress.current = ""
+    progress.message = ("the app is installed: let your loader register it" if not refused else
+                        f"the app is installed, but the FTP server refused to mark {refused} files executable: "
+                        "set 755 on eboot.bin and the .prx files from an FTP client")
+    report(progress)
+
+
+class Remote(FtpRemote):
+    """pw_prefix's FTP remote, with SITE CHMOD for the app's executables."""
+
+    def __init__(self, host: str, port: int):
+        super().__init__(host, port)
+        # Binary mode from the start: some servers answer SIZE only in it.
+        try:
+            self.ftp.voidcmd("TYPE I")
+        except ftplib.all_errors:
+            pass
+
+    def clone(self) -> "Remote":
+        """One more connection to the same console, for sending beside this
+        one. It shares the folders known to be made."""
+        other = Remote(self.host, self.port)
+        other.made = self.made
+        return other
+
+    def chmod(self, path: str, mode: str) -> bool:
+        try:
+            self.ftp.sendcmd(f"SITE CHMOD {mode} {path}")
+            return True
+        except ftplib.all_errors:
+            return False
+
+
+def fetch_logs(remote, folder: Path | str, stamp: str) -> tuple[Path, str]:
+    """Copies the app's logs and the games' profiles from the console into
+    one zip in folder. Returns the zip and the newest session log's name."""
+    logs, profiles = f"{REMOTE_ROOT}/logs", f"{REMOTE_ROOT}/profiles"
+    if not remote.exists(logs):
+        raise QuickError(f"the PS5 has no {logs} yet: start the prospero-win app once first")
+    newest = ""
+    try:
+        last = (int(remote.read(f"{logs}/next.txt").decode().strip() or 0) - 1) % 8
+        newest = f"session-{last}.log"
+    except (OSError, EOFError, ValueError, ftplib.Error):
+        pass
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"prospero-win-logs-{stamp}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        for directory, name_ok in ((logs, lambda name: name.endswith((".log", ".txt"))),
+                                   (profiles, lambda name: name.endswith((".profile", ".lst")))):
+            if not remote.exists(directory):
+                continue
+            for name, (kind, _) in sorted(remote.listdir(directory).items()):
+                if kind == "file" and name_ok(name):
+                    archive.writestr(f"{posixpath.basename(directory)}/{name}", remote.read(f"{directory}/{name}"))
+    return out, newest
+
+
+# The ELF loader (ps5-payload-dev elfldr) runs what is sent to this port.
+ELF_PORT = 9021
+PAYLOAD_GAP = 2.0
+
+
+def send_payload(host: str, port: int, path: Path | str) -> int:
+    """Sends one payload (.elf or .bin) to the console's ELF loader, which
+    starts it once the connection closes. Returns its size."""
+    data = Path(path).read_bytes()
+    try:
+        with socket.create_connection((host, port), timeout=30) as connection:
+            connection.sendall(data)
+            connection.shutdown(socket.SHUT_WR)
+    except OSError as error:
+        raise QuickError(f"the ELF loader at {host}:{port} did not take {Path(path).name} ({error}): "
+                         "check the port and that the loader is running") from error
+    return len(data)
+
+
+def send_payloads(host: str, port: int, paths: Iterable[Path | str], say: Callable[[str], None] = print,
+                  gap: float = PAYLOAD_GAP, cancel: threading.Event | None = None) -> int:
+    """Sends payloads one after another, gap seconds apart."""
+    cancel = cancel or threading.Event()
+    sent = 0
+    for index, path in enumerate(paths):
+        if index and cancel.wait(gap):
+            raise Cancelled()
+        say(f"sending {Path(path).name} to {host}:{port}")
+        size = send_payload(host, port, path)
+        sent += 1
+        say(f"sent {Path(path).name} ({size:,} bytes)")
+    return sent
+
+
+def connect(host: str, port: int) -> Remote:
+    try:
+        return Remote(host, port)
+    except (OSError, EOFError, *ftplib.all_errors) as error:
+        raise QuickError(f"no FTP server answers at {host}:{port} ({error}): "
+                         "check the address and that the PS5's FTP payload is running") from error
+
+
+# --- command line ----------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("game", nargs="?", help="the game's zip or folder")
+    parser.add_argument("--base", help="the base prefix's zip or folder (tools/pw_base_prefix.py)")
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", type=int, default=2121)
+    parser.add_argument("--name")
+    parser.add_argument("--slug")
+    parser.add_argument("--exe", help="the game's executable, inside its zip or folder")
+    parser.add_argument("--graphics", choices=GRAPHICS)
+    parser.add_argument("--arguments", default="")
+    parser.add_argument("--desktop", default="1920x1080")
+    parser.add_argument("--preset", default="")
+    parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                        help="an environment variable for the game (added to the ones detected)")
+    parser.add_argument("--mono", help=f"{MONO_NAME}.zip, for .NET Framework and XNA games")
+    parser.add_argument("--winedebug", default="", help="Wine log channels for the game, e.g. err+all,+seh")
+    parser.add_argument("--dxvk", help="a DXVK release tarball, instead of downloading the pinned one")
+    parser.add_argument("--overwrite", action="store_true", help="replace the console's copy of the game")
+    parser.add_argument("--settings-only", action="store_true",
+                        help="only rewrite the profile of a game already on the console")
+    parser.add_argument("--install-app", metavar="RELEASE_ZIP", help="install the prospero-win app instead")
+    args = parser.parse_args(argv)
+
+    last = [0]
+
+    def report(progress: Progress) -> None:
+        percent = int(100 * progress.done_bytes / max(progress.total_bytes, 1))
+        if percent != last[0] or progress.message:
+            print(f"pw_quick: {percent}% {progress.message or progress.current}", flush=True)
+            progress.message, last[0] = "", percent
+    try:
+        if args.install_app:
+            remote = connect(args.host, args.port)
+            install_app(remote, Source(args.install_app), report)
+            return 0
+        if not args.game or not args.base:
+            parser.error("give the game's zip or folder and --base")
+        source, base = Source(args.game), Source(args.base)
+        game, exes = suggest(source)
+        if args.exe:
+            match = next((exe for exe in exes if exe.key.lower() == args.exe.replace("\\", "/").lower()), None)
+            if match is None:
+                raise QuickError(f"{args.exe} is not one of the game's executables: "
+                                 + ", ".join(exe.key for exe in exes))
+            game.exe, game.bits = match.key, match.info.bits
+            game.graphics = guess_graphics(source, match)
+        if args.name:
+            game.name = args.name
+            game.slug = slugify(args.name)
+        game.slug = args.slug or game.slug
+        game.graphics = args.graphics or game.graphics
+        game.arguments, game.desktop, game.preset = args.arguments, args.desktop, args.preset
+        game.environment.update(parse_environment("\n".join(args.env)))
+        game.winedebug = args.winedebug
+        print(f"pw_quick: {game.name} ({game.slug}): {game.exe}, {game.bits}-bit, graphics {game.graphics}")
+        dxvk = None
+        if game.uses_dxvk:
+            dxvk = dxvk_files(Path(args.dxvk) if args.dxvk else fetch_dxvk())
+        remote = connect(args.host, args.port)
+        mono = Source(args.mono) if game.mono and args.mono else None
+        sender = Sender(remote, game, source, base, dxvk=dxvk, host=args.host, report=report, mono=mono)
+        if args.settings_only:
+            sender.update_settings()
+        else:
+            sender.send(args.overwrite)
+    except (QuickError, OSError, *ftplib.all_errors) as error:
+        print(f"pw_quick: {error}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, Cancelled):
+        print("pw_quick: stopped; send again to carry on where it stopped", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

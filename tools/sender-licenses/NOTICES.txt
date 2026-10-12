@@ -1,0 +1,57 @@
+prospero-win sender: third-party notices and where the source is
+
+prospero-win-sender.exe
+  The sender (tools/pw_gui.py, pw_quick.py, pw_autoconfig.py, pw_prefix.py)
+  is part of prospero-win, LGPL-2.1-or-later (LGPL-2.1.txt). Original project:
+  https://github.com/mpereiraesaa/prospero-win
+  This build's source, with the sender and the media DLLs' build scripts:
+  https://github.com/SloppyStakes/Prospero-Sender
+  Packed with PyInstaller; contains Python 3 (Python-PSF.txt) and Tcl/Tk
+  (Tcl-Tk.txt).
+  Also inside: Steamworks.NET 7.0.0 by Riley Labrecque (MIT,
+  Steamworks.NET-MIT.txt), built by tools/build_steamworks.sh with one change
+  (SteamAPI.Init answers false without Steam). It is copied only into games
+  that name it and don't ship it. No Valve files are included.
+  Source: https://github.com/rlabrecque/Steamworks.NET (tag 7.0.0).
+
+prospero-base-prefix.zip
+  Wine prefix made by Wine 11.17 (LGPL-2.1-or-later, LGPL-2.1.txt).
+  Source: https://gitlab.winehq.org/wine/wine (commit 490f6d5) with
+  prospero-win's patches (tools/build_host_wine.sh in the source above).
+
+  windows/system32 and syswow64: winegstreamer.dll, winedmo.dll
+    Wine's own code (LGPL-2.1-or-later) with prospero-win's changes in
+    tools/media/ and tools/build_media.sh of the source above.
+  windows/system32 and syswow64: avcodec-pw-61.dll, avformat-pw-61.dll,
+    avutil-pw-59.dll, swresample-pw-5.dll, swscale-pw-8.dll
+    FFmpeg 7.1 (LGPL-2.1-or-later, LGPL-2.1.txt), unmodified, built without
+    GPL parts by tools/build_media.sh. Source: https://github.com/FFmpeg/FFmpeg
+    (tag n7.1).
+  Program Files/LAV Filters
+    LAV Filters 0.79.2 by Hendrik Leppkes, unmodified release binaries
+    (GPL-2.0-or-later, LAV-Filters-GPL-2.0.txt).
+    Source: https://github.com/Nevcairiel/LAVFilters (tag 0.79.2).
+  windows/Fonts/Liberation*.ttf
+    Liberation fonts 2.1.5, SIL Open Font License 1.1 (Liberation-OFL-1.1.txt).
+  windows/Fonts/ipag.ttf
+    IPAGothic 003.03, IPA Font License v1.0 (IPAGothic-IPA-Font-License.txt).
+
+wine-mono-11.3.0.zip
+  Wine Mono 11.3.0 (Mono, FNA, FAudio, FNA3D, SDL3, winforms, wpf and more),
+  unmodified release with build-only files removed by tools/build_mono.sh.
+  MIT, LGPL, MS-PL and zlib licenses (Wine-Mono-COPYING.txt).
+  Source: https://github.com/madewokherd/wine-mono (tag wine-mono-11.3.0).
+
+DXVK is downloaded from its GitHub release when a game needs it, not shipped
+here.
+
+No Microsoft or Sony files and no games are included. "PS5" names the console
+the app runs on; this project is not made or endorsed by Sony.
+
+vkd3d-proton 3.0.1 (d3d12_original.dll, d3d12core.dll, sent beside Direct3D 12 games)
+  LGPL 2.1, Copyright the vkd3d and vkd3d-proton authors.
+  Source: https://github.com/HansKristian-Work/vkd3d-proton (tag v3.0.1)
+  License text: LGPL-2.1.txt.
+
+d3d12.dll proxy (sent beside Direct3D 12 games): part of the sender,
+  source in tools/d3d12_proxy of the repository above.
