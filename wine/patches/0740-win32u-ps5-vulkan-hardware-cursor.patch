@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 2 Oct 2026 09:51:58 +0200
+Subject: [PATCH] win32u: Show the cursor over PS5 Vulkan frames with
+ VideoOut's hardware cursor.
+
+Vulkan frames reach the screen through the GPU driver's own video output
+(patch 0460), which the PS5 user driver does not compose, so a Direct3D
+game through DXVK showed no pointer in its menus (Half-Life 2). After
+each present, win32u hands the cursor the application set (straight-alpha
+ARGB from the user driver, NULL when hidden) and its place on the desktop
+to libvulkan.prx's pw_videoout_cursor, which shows it with VideoOut's
+hardware cursor over the swapchain's frames. OpenGL games, which draw
+through Mesa's Zink and present with Vulkan, get their pointer the same
+way. The cursor image is read under the screen lock, as the driver's own
+composition reads it.
+---
+ dlls/win32u/ps5drv.c | 24 ++++++++++++++++++++++++
+ dlls/win32u/vulkan.c |  7 +++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 286d42d..ccc69c0 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -716,6 +716,30 @@ static void ps5_SetCursor( HWND hwnd, HCURSOR handle )
+     TRACE( "cursor %p: %ux%u\n", handle, width, height );
+ }
+ 
++#ifdef SONAME_LIBVULKAN
++/* Vulkan frames reach the screen through the GPU driver's own video output
++ * (patch 0460), which this driver does not compose, so after each present
++ * libvulkan.prx shows the cursor with VideoOut's hardware cursor
++ * (pw_videoout_cursor): the image, NULL when hidden, at its place on the
++ * desktop, which the output shows whole. */
++void ps5drv_vulkan_cursor( void *vulkan_handle )
++{
++    static int (*show)( const UINT32 *, UINT, UINT, INT, INT, UINT, UINT );
++    static BOOL looked;
++
++    if (!looked)
++    {
++        looked = TRUE;
++        show = dlsym( vulkan_handle, "pw_videoout_cursor" );
++    }
++    if (!show) return;
++    pthread_mutex_lock( &screen_lock );
++    show( cursor_width && cursor_height ? cursor_image : NULL, cursor_width, cursor_height,
++          cursor.x - cursor_hotspot.x, cursor.y - cursor_hotspot.y, screen_width, screen_height );
++    pthread_mutex_unlock( &screen_lock );
++}
++#endif
++
+ static BOOL ps5_GetCursorPos( POINT *pos )
+ {
+     /* the server's position is the pointer's: every move goes through it */
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index cb64dc0..7fadce0 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2023,6 +2023,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+ 
+     if (swapchains != swapchains_buffer) free( swapchains );
+ 
++#ifdef WINE_PS5_USER_DRIVER
++    {
++        extern void ps5drv_vulkan_cursor( void *vulkan_handle );
++        ps5drv_vulkan_cursor( vulkan_handle );
++    }
++#endif
++
+     if (TRACE_ON( fps ))
+     {
+         static unsigned long frames, frames_total;
+-- 
+2.43.0
