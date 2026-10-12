@@ -186,6 +186,13 @@ class App:
         self.source: pw_quick.Source | None = None
         self.exes: list[pw_quick.Executable] = []
         settings = load_settings()
+        self.lanes = tk.StringVar(value=str(settings.get("lanes", pw_quick.FTP_LANES)))
+
+        menubar = tk.Menu(root)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="FTP connections…", command=self.edit_lanes)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        root.config(menu=menubar)
 
         root.title(TITLE)
         root.minsize(620, 0)
@@ -375,7 +382,38 @@ class App:
             entry["on"] = index in chosen
         save_settings({"host": self.host.get().strip(), "port": self.port.get().strip(),
                        "base": self.base.get().strip(), "desktop": self.desktop.get().strip(),
-                       "elf_port": self.elf_port.get().strip(), "payloads": self.payloads})
+                       "elf_port": self.elf_port.get().strip(), "payloads": self.payloads,
+                       "lanes": self.lanes.get().strip()})
+
+    def edit_lanes(self) -> None:
+        """Settings > FTP connections: how many connections a send uses at once."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("FTP connections")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.grid(sticky="nsew")
+        value = tk.StringVar(value=self.lanes.get())
+        low, high = pw_quick.FTP_LANES_RANGE
+        ttk.Label(frame, text=f"Connections to the PS5 for a send ({low} to {high}):", wraplength=320,
+                  justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Spinbox(frame, from_=low, to=high, textvariable=value, width=6).grid(row=1, column=0, sticky="w", pady=8)
+        ttk.Label(frame, text=f"Default {pw_quick.FTP_LANES}. More is faster only if the PS5 keeps up;\n"
+                              "if it refuses connections, a send uses fewer.", justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+
+        def save() -> None:
+            try:
+                lanes = pw_quick.parse_lanes(value.get())
+            except QuickError as error:
+                messagebox.showerror("FTP connections", str(error), parent=dialog)
+                return
+            self.lanes.set(str(lanes))
+            self.remember()
+            dialog.destroy()
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0)
+        ttk.Button(buttons, text="Save", command=save).grid(row=0, column=1, padx=(6, 0))
 
     # --- payloads ----------------------------------------------------------------
     def show_payloads(self) -> None:
@@ -673,7 +711,8 @@ class App:
             remote = pw_quick.connect(host, port)
             try:
                 sender = pw_quick.Sender(remote, game, source, base, dxvk=dxvk, host=host, report=report,
-                                         cancel=self.cancel, mono=mono)
+                                         cancel=self.cancel, mono=mono,
+                                         lanes=pw_quick.parse_lanes(self.lanes.get()))
                 if settings_only:
                     sender.update_settings()
                 else:

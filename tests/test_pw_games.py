@@ -149,3 +149,18 @@ def test_delete_game_empties_the_list_when_it_was_the_last_game():
 def test_delete_game_when_nothing_is_left():
     with tempfile.TemporaryDirectory() as state:
         pw_quick.delete_game(FakeConsole({}), "ghost", state_dir=state)
+
+
+def test_parse_lanes_accepts_whole_numbers_in_range():
+    assert pw_quick.parse_lanes("4") == 4
+    assert pw_quick.parse_lanes(" 1 ") == 1
+    assert pw_quick.parse_lanes(8) == 8
+
+
+def test_parse_lanes_refuses_out_of_range_and_non_numbers():
+    for bad in ("0", "9", "-2", "2.5", "four", ""):
+        try:
+            pw_quick.parse_lanes(bad)
+        except pw_quick.QuickError:
+            continue
+        raise AssertionError(f"{bad!r} should be refused")

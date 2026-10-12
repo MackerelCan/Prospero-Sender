@@ -71,6 +71,7 @@ FTP_ATTEMPTS = 6
 # prefix's thousands of small files is most of the time; ftpsrv serves each
 # connection on its own thread, so they overlap.
 FTP_LANES = 4
+FTP_LANES_RANGE = (1, 8)
 # Wine Mono, Wine's .NET Framework 4 stand-in, for .NET Framework and XNA
 # games: one copy on the console, which each such game's prefix points at
 # (HKCU\Software\Wine\Mono RuntimePath; Z: is the console's /). The
@@ -1474,6 +1475,18 @@ SAVE_FOLDERS = ("AppData", "Documents", "Saved Games")
 PREFIX_USER = "prospero"
 
 
+def parse_lanes(text: "str | int") -> int:
+    """The number of FTP connections a send uses: a whole number from 1 to 8."""
+    try:
+        value = int(str(text).strip())
+    except ValueError:
+        raise QuickError("the FTP connections must be a whole number") from None
+    low, high = FTP_LANES_RANGE
+    if not low <= value <= high:
+        raise QuickError(f"the FTP connections must be from {low} to {high}")
+    return value
+
+
 def installed_games(remote) -> list[tuple[str, str]]:
     """(slug, name) of each game the console has a profile for, by name."""
     profiles = f"{REMOTE_ROOT}/profiles"
@@ -1619,6 +1632,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--winedebug", default="", help="Wine log channels for the game, e.g. err+all,+seh")
     parser.add_argument("--dxvk", help="a DXVK release tarball, instead of downloading the pinned one")
     parser.add_argument("--overwrite", action="store_true", help="replace the console's copy of the game")
+    parser.add_argument("--lanes", default=str(FTP_LANES), metavar="N",
+                        help=f"FTP connections to send over, {FTP_LANES_RANGE[0]} to {FTP_LANES_RANGE[1]} (default {FTP_LANES})")
     parser.add_argument("--settings-only", action="store_true",
                         help="only rewrite the profile of a game already on the console")
     parser.add_argument("--install-app", metavar="RELEASE_ZIP", help="install the prospero-win app instead")
@@ -1661,7 +1676,8 @@ def main(argv: list[str] | None = None) -> int:
             dxvk = dxvk_files(Path(args.dxvk) if args.dxvk else fetch_dxvk())
         remote = connect(args.host, args.port)
         mono = Source(args.mono) if game.mono and args.mono else None
-        sender = Sender(remote, game, source, base, dxvk=dxvk, host=args.host, report=report, mono=mono)
+        sender = Sender(remote, game, source, base, dxvk=dxvk, host=args.host, report=report, mono=mono,
+                        lanes=parse_lanes(args.lanes))
         if args.settings_only:
             sender.update_settings()
         else:
