@@ -59,8 +59,13 @@ select, ↑ and ↓ to reorder, and **Inject selected** sends them top to bottom
    `eboot.bin` and the modules executable.
 2. Press **Choose zip…** or **Choose folder…** and pick the game. The sender
    reads the game's programs and fills in:
-   - **Program to start:** the likeliest executable, skipping installers,
-     uninstallers and tools. Pick another if it guessed wrong.
+   - **Game program:** the likeliest executable, skipping installers,
+     uninstallers and tools. Pick another if it guessed wrong; the one you
+     pick stays the game.
+   - **Start through:** the launcher the game program is started by
+     (RA2.exe for Red Alert 2's Game.exe), or (none). The console can't
+     start a second program, so pwexec runs the launcher and then the game
+     in one process. Change it if the guess is wrong.
    - **Graphics:** Direct3D 8 to 11 through DXVK, OpenGL, or 2D, from the
      DLLs the game's program and its own DLLs use.
    - **Resolution**, a **controller preset** from prospero-win-profiles'
