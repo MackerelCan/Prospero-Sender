@@ -211,6 +211,9 @@ class FtpRemote:
         # ftpsrv confirms a delete with 226, which ftplib's delete() refuses.
         self.ftp.sendcmd(f"DELE {path}")
 
+    def rmdir(self, path: str) -> None:
+        self.ftp.rmd(path)
+
     def close(self) -> None:
         self.ftp.quit()
 

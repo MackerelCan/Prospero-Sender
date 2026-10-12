@@ -1468,6 +1468,95 @@ def fetch_logs(remote, folder: Path | str, stamp: str) -> tuple[Path, str]:
     return out, newest
 
 
+# The folders under a Windows game's user profile where its saves usually go.
+# Saves kept in the game's own folder (drive_c/Games/<name>) are not included.
+SAVE_FOLDERS = ("AppData", "Documents", "Saved Games")
+PREFIX_USER = "prospero"
+
+
+def installed_games(remote) -> list[tuple[str, str]]:
+    """(slug, name) of each game the console has a profile for, by name."""
+    profiles = f"{REMOTE_ROOT}/profiles"
+    if not remote.exists(profiles):
+        return []
+    games = []
+    for name, (kind, _) in sorted(remote.listdir(profiles).items()):
+        if kind != "file" or not name.endswith(".profile"):
+            continue
+        slug, shown = name[: -len(".profile")], ""
+        for line in remote.read(f"{profiles}/{name}").decode("utf-8", "replace").splitlines():
+            if line.startswith("name = "):
+                shown = line[len("name = "):].strip()
+                break
+        games.append((slug, shown or slug))
+    return sorted(games, key=lambda game: game[1].lower())
+
+
+def remote_files(remote, path: str, prefix: str = "") -> list[tuple[str, str]]:
+    """(name inside the folder, path on the console) of every file under path."""
+    found = []
+    for name, (kind, _) in sorted(remote.listdir(path).items()):
+        full = f"{path}/{name}"
+        if kind == "dir":
+            found += remote_files(remote, full, f"{prefix}{name}/")
+        elif kind == "file":
+            found.append((f"{prefix}{name}", full))
+    return found
+
+
+def export_saves(remote, slug: str, folder: Path | str, stamp: str) -> tuple[Path, int]:
+    """Copies a game's save files from its prefix on the console into one zip
+    in folder. Returns the zip and how many files it holds."""
+    prefix = f"{REMOTE_ROOT}/prefixes/{slug}"
+    if not remote.exists(prefix):
+        raise QuickError(f"{slug} has no prefix on the PS5")
+    user = f"{prefix}/drive_c/users/{PREFIX_USER}"
+    files = []
+    for name in SAVE_FOLDERS:
+        if remote.exists(f"{user}/{name}"):
+            files += [(f"{name}/{rel}", full) for rel, full in remote_files(remote, f"{user}/{name}")]
+    if not files:
+        raise QuickError(f"no save files for {slug} in its user folders on the PS5")
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"{slug}-saves-{stamp}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        for rel, full in files:
+            archive.writestr(rel, remote.read(full))
+    return out, len(files)
+
+
+def remove_tree(remote, path: str) -> None:
+    """Deletes a folder on the console with everything in it."""
+    for name, (kind, _) in remote.listdir(path).items():
+        full = f"{path}/{name}"
+        if kind == "dir":
+            remove_tree(remote, full)
+        else:
+            remote.delete(full)
+    remote.rmdir(path)
+
+
+def delete_game(remote, slug: str, host: str = "console", state_dir: Path | str = STATE_DIR) -> None:
+    """Removes a game from the console: its prefix, its profile and its line in
+    profiles.lst. This PC's record of what was sent is cleared too, so sending
+    the game again starts in full."""
+    prefix = f"{REMOTE_ROOT}/prefixes/{slug}"
+    if remote.exists(prefix):
+        remove_tree(remote, prefix)
+    profiles = f"{REMOTE_ROOT}/profiles"
+    name = f"{slug}.profile"
+    if remote.size(f"{profiles}/{name}") is not None:
+        remote.delete(f"{profiles}/{name}")
+    listing = f"{profiles}/profiles.lst"
+    if remote.size(listing) is not None:
+        lines = remote.read(listing).decode("latin-1").splitlines()
+        kept = [line for line in lines if line.strip() and line.strip() != name]
+        remote.write(listing, ("\n".join(kept) + "\n").encode("latin-1") if kept else b"")
+    record = Path(state_dir) / f"{re.sub(r'[^A-Za-z0-9.-]', '_', host)}-{slug}.json"
+    record.unlink(missing_ok=True)
+
+
 # The ELF loader (ps5-payload-dev elfldr) runs what is sent to this port.
 ELF_PORT = 9021
 PAYLOAD_GAP = 2.0
