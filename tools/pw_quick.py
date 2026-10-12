@@ -520,8 +520,7 @@ class Game:
         elif self.graphics == "d3d12":
             lines.append(f"dll_overrides = {','.join(DXVK_DLLS)},d3d12,d3d12core=n")
         elif self.graphics == "opengl":
-            # OpenGL draws through Mesa's Zink (v0.2.0): the app's native opengl32.
-            lines.append("dll_overrides = opengl32=n")
+            lines.append("dll_overrides = opengl32=b")
         lines += [f"prefix = {self.slug}", "runtime = wine-wow64", f"architecture = pe{self.bits}",
                   f"graphics = {'dxvk' if self.graphics == 'd3d12' else self.graphics}",
                   "", "[display]", f"desktop = {self.desktop}", f"scaling = {self.scaling}"]
