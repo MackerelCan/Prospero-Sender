@@ -67,7 +67,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686 gcc-mingw-w64-x86-64
           g++-mingw-w64-i686 g++-mingw-w64-x86-64 flex bison gettext libfreetype-dev
-          libfontconfig-dev libgnutls28-dev libx11-dev libxext-dev
+          libfontconfig-dev libgnutls28-dev libx11-dev libxext-dev nasm
       - name: The pinned Wine revision
         run: |
           commit=$(sed -n 's/^WINE_COMMIT=//p' tools/build_wine_ps5.sh)
@@ -76,9 +76,26 @@ jobs:
           git -C "$RUNNER_TEMP/wine" branch pinned FETCH_HEAD
       - name: The PC's Wine
         run: tools/build_host_wine.sh --source "$RUNNER_TEMP/wine" --work "$RUNNER_TEMP/wine-host" --jobs 4
+      - name: Media decoders (FFmpeg behind winegstreamer and winedmo)
+        run: >-
+          tools/build_media.sh --out "$RUNNER_TEMP/media" --work "$RUNNER_TEMP/media-work"
+          --wine-work "$RUNNER_TEMP/wine-host" --jobs 4
+      - name: LAV Filters and the Liberation fonts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts-src" "$RUNNER_TEMP/fonts"
+          gh release download 0.79.2 -R Nevcairiel/LAVFilters -D "$RUNNER_TEMP/lav" \
+            -p 'LAVFilters-*-x64.zip' -p 'LAVFilters-*-x86.zip'
+          gh release download -R liberationfonts/liberation-fonts -D "$RUNNER_TEMP/fonts-src" \
+            -p 'liberation-fonts-ttf-*.tar.gz'
+          tar -xzf "$RUNNER_TEMP"/fonts-src/liberation-fonts-ttf-*.tar.gz -C "$RUNNER_TEMP/fonts-src"
+          find "$RUNNER_TEMP/fonts-src" -name '*.ttf' -exec cp {} "$RUNNER_TEMP/fonts/" \;
+          ls "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts"
       - name: The base prefix
         run: >-
           python3 tools/pw_base_prefix.py --wine "$RUNNER_TEMP/wine-host/install/usr/bin/wine"
+          --fonts "$RUNNER_TEMP/fonts" --lav "$RUNNER_TEMP/lav" --media "$RUNNER_TEMP/media"
           --out prospero-base-prefix.zip
       - uses: actions/upload-artifact@v4
         with:
