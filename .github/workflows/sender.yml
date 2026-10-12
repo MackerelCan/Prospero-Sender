@@ -63,6 +63,21 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: LAV Filters and the Liberation fonts
+        run: |
+          mkdir -p "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts-src" "$RUNNER_TEMP/fonts"
+          curl -fsSL -o "$RUNNER_TEMP/lav/LAVFilters-0.79.2-x64.zip" \
+            https://github.com/Nevcairiel/LAVFilters/releases/download/0.79.2/LAVFilters-0.79.2-x64.zip
+          curl -fsSL -o "$RUNNER_TEMP/lav/LAVFilters-0.79.2-x86.zip" \
+            https://github.com/Nevcairiel/LAVFilters/releases/download/0.79.2/LAVFilters-0.79.2-x86.zip
+          curl -fsSL -o "$RUNNER_TEMP/fonts-src/liberation.tar.gz" \
+            https://github.com/liberationfonts/liberation-fonts/files/7261482/liberation-fonts-ttf-2.1.5.tar.gz
+          tar -xzf "$RUNNER_TEMP/fonts-src/liberation.tar.gz" -C "$RUNNER_TEMP/fonts-src"
+          find "$RUNNER_TEMP/fonts-src" -name '*.ttf' -exec cp {} "$RUNNER_TEMP/fonts/" \;
+          count=$(ls "$RUNNER_TEMP/fonts" | wc -l)
+          echo "Liberation fonts: $count"
+          [ "$count" -ge 12 ] || { echo "expected 12 Liberation TTFs" >&2; exit 1; }
+          ls "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts"
       - name: Build dependencies
         run: >-
           sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686 gcc-mingw-w64-x86-64
@@ -80,18 +95,6 @@ jobs:
         run: >-
           tools/build_media.sh --out "$RUNNER_TEMP/media" --work "$RUNNER_TEMP/media-work"
           --wine-work "$RUNNER_TEMP/wine-host" --jobs 4
-      - name: LAV Filters and the Liberation fonts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts-src" "$RUNNER_TEMP/fonts"
-          gh release download 0.79.2 -R Nevcairiel/LAVFilters -D "$RUNNER_TEMP/lav" \
-            -p 'LAVFilters-*-x64.zip' -p 'LAVFilters-*-x86.zip'
-          gh release download -R liberationfonts/liberation-fonts -D "$RUNNER_TEMP/fonts-src" \
-            -p 'liberation-fonts-ttf-*.tar.gz'
-          tar -xzf "$RUNNER_TEMP"/fonts-src/liberation-fonts-ttf-*.tar.gz -C "$RUNNER_TEMP/fonts-src"
-          find "$RUNNER_TEMP/fonts-src" -name '*.ttf' -exec cp {} "$RUNNER_TEMP/fonts/" \;
-          ls "$RUNNER_TEMP/lav" "$RUNNER_TEMP/fonts"
       - name: The base prefix
         run: >-
           python3 tools/pw_base_prefix.py --wine "$RUNNER_TEMP/wine-host/install/usr/bin/wine"
