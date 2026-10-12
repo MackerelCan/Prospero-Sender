@@ -312,7 +312,7 @@ def plan(source, exe, imports: set[str], graphics: str) -> Plan:
         result.engine = "Java"
         result.graphics = "opengl"
         result.warn("Java games are usually started by a launcher that the console can't run; "
-                    "pick the program to start carefully")
+                    "pick the game program carefully")
 
     # .NET
     xna = files.find(r"(^|/)microsoft\.xna\.framework[^/]*\.dll$")

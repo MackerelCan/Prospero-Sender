@@ -796,6 +796,82 @@ def test_dotnet_game_keeps_its_launcher() -> None:
             source.close()
 
 
+def _ra2_zip(tmp: str) -> Path:
+    """RA2.exe (draws nothing) starts Game.exe (DirectDraw); a 64-bit tool
+    and a setup program sit beside them, and an editor in a subfolder."""
+    zip_path = Path(tmp) / "ra2.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("RA2.exe", pe(32, ("kernel32.dll", "user32.dll", "gdi32.dll"), padding=2_000_000))
+        archive.writestr("Game.exe", pe(32, ("kernel32.dll", "ddraw.dll"), padding=1_000_000))
+        archive.writestr("Setup.exe", pe(32, ("kernel32.dll", "user32.dll"), padding=100_000))
+        archive.writestr("Tool64.exe", pe(64, ("kernel32.dll", "user32.dll"), padding=100_000))
+        archive.writestr("Maps/MapEdit.exe", pe(32, ("kernel32.dll", "user32.dll"), padding=100_000))
+    return zip_path
+
+
+def test_launcher_choices_are_the_games_programs_of_its_architecture() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        source = pw_quick.Source(_ra2_zip(tmp))
+        try:
+            exes = pw_quick.find_executables(source, "ra2")
+            choices = pw_quick.launcher_choices("Game.exe", exes)
+            assert "Game.exe" not in choices and "Tool64.exe" not in choices, choices
+            assert choices[0] == "RA2.exe", choices                  # same folder, not a tool
+            assert choices.index("Setup.exe") < choices.index("Maps/MapEdit.exe"), choices
+            assert pw_quick.launcher_choices("Nope.exe", exes) == []
+        finally:
+            source.close()
+
+
+def test_picked_game_program_stays_the_game() -> None:
+    """Picking RA2.exe as the game keeps it, with no launcher and a warning;
+    picking Game.exe fills in RA2.exe as its launcher."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = pw_quick.Source(_ra2_zip(tmp))
+        try:
+            exes = pw_quick.find_executables(source, "ra2")
+            ra2 = next(exe for exe in exes if exe.key == "RA2.exe")
+            game = pw_quick.choose_game(source, ra2, exes, "Red Alert 2")
+            assert game.exe == "RA2.exe" and game.launcher == "", (game.exe, game.launcher)
+            assert any("Start through" in check.text for check in game.checks), game.checks
+            assert "pwexec" not in game.profile()
+            main_exe = next(exe for exe in exes if exe.key == "Game.exe")
+            game = pw_quick.choose_game(source, main_exe, exes, "Red Alert 2")
+            assert game.exe == "Game.exe" and game.launcher == "RA2.exe", (game.exe, game.launcher)
+            assert '"RA2.exe"' in game.profile()
+        finally:
+            source.close()
+
+
+def test_chosen_launcher_or_none_is_kept() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        source = pw_quick.Source(_ra2_zip(tmp))
+        try:
+            exes = pw_quick.find_executables(source, "ra2")
+            main_exe = next(exe for exe in exes if exe.key == "Game.exe")
+            plan = pw_quick.plan_for(source, main_exe)
+            none = pw_quick.configured(source, main_exe, plan, "RA2", exes, launcher="")
+            assert none.exe == "Game.exe" and none.launcher == "", (none.exe, none.launcher)
+            assert "pwexec" not in none.profile()
+            assert not any("starts through" in check.text for check in none.checks)
+            other = pw_quick.configured(source, main_exe, plan, "RA2", exes, launcher="Maps/MapEdit.exe")
+            assert other.launcher == "Maps/MapEdit.exe"
+            assert "pwexec32.exe" in other.profile() and '"MapEdit.exe"' in other.profile()
+            sender = pw_quick.Sender.__new__(pw_quick.Sender)
+            sender.game, sender.mono, sender.source = other, None, source
+            assert f"{other.folder}/Maps/pwexec32.exe" in sender.stand_ins()   # beside the launcher
+            again = pw_quick.configured(source, main_exe, plan, "RA2", exes, launcher="RA2.exe")
+            assert sum("starts through" in check.text for check in again.checks) == 1, again.checks
+            try:
+                pw_quick.configured(source, main_exe, plan, "RA2", exes, launcher="Tool64.exe")
+            except pw_quick.QuickError:
+                pass
+            else:
+                raise AssertionError("a 64-bit launcher for a 32-bit game was accepted")
+        finally:
+            source.close()
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

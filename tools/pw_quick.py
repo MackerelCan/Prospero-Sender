@@ -586,13 +586,59 @@ def launch_pair(exe: Executable, exes: list[Executable]) -> tuple[Executable, st
     return best, exe.key
 
 
+def launcher_choices(game_key: str, exes: list[Executable]) -> list[str]:
+    """The programs the game can be started through: the game's other
+    windowed programs of its own architecture (pwexec runs the launcher and
+    the game in one process), the game's own folder first, tools last."""
+    game = next((exe for exe in exes if exe.key == game_key), None)
+    if game is None:
+        return []
+    here = posixpath.dirname(game_key)
+    others = [exe for exe in exes
+              if exe.key != game_key and exe.info.bits == game.info.bits and exe.info.gui]
+    others.sort(key=lambda exe: (posixpath.dirname(exe.key) != here, _is_tool(exe), -exe.score, exe.key.lower()))
+    return [exe.key for exe in others]
+
+
+def plan_for(source: Source, exe: Executable) -> pw_autoconfig.Plan:
+    """What this program needs, taken as the game itself."""
+    return pw_autoconfig.plan(source, exe, game_imports(source, exe), guess_graphics(source, exe))
+
+
+def choose_game(source: Source, exe: Executable, exes: list[Executable], name: str) -> Game:
+    """The game program someone picked, kept as the game. Only the launcher
+    is guessed: a sibling that draws nothing, when the picked program draws.
+    An engine's real program (Unreal's shipping exe) still replaces its stub."""
+    exe, plan = autoconfigure(source, exe, exes)
+    launcher = ""
+    if not plan.exe and _draws(exe) and not _is_tool(exe):
+        launcher = launch_pair(exe, exes)[1]
+    game = configured(source, exe, plan, name, exes, launcher=launcher)
+    if not _draws(exe) and any(_draws(other) for other in exes
+                               if other.key in launcher_choices(exe.key, exes)):
+        game.checks = [pw_autoconfig.Check(
+            pw_autoconfig.WARN,
+            f"{posixpath.basename(exe.key)} loads no graphics library itself: if it is a launcher, "
+            "choose the game program instead and put this one under Start through")] + list(game.checks)
+    return game
+
+
 def configured(source: Source, exe: Executable, plan: pw_autoconfig.Plan, name: str,
-               exes: list[Executable] | None = None) -> Game:
+               exes: list[Executable] | None = None, launcher: str | None = None) -> Game:
+    """The game's settings. launcher None pairs a launcher and the game
+    automatically (launch_pair); "" or a program's key is taken as chosen,
+    with exe as the game."""
     environment = suggest_environment(source)
     environment.update(plan.environment)
+    if launcher is not None:
+        if launcher and launcher not in launcher_choices(exe.key, exes if exes is not None
+                                                            else find_executables(source, name)):
+            raise QuickError(f"{launcher} can't start {exe.key}: it must be another windowed "
+                             f"{exe.info.bits}-bit program of the game")
+        game_exe = exe
     # Unreal and Ren'Py name the real program and start it directly. Every
     # other game, including .NET and XNA, can still be handed off by a launcher.
-    if plan.exe:
+    elif plan.exe:
         game_exe, launcher = exe, ""
     else:
         game_exe, launcher = launch_pair(exe, exes if exes is not None else find_executables(source, name))
@@ -604,15 +650,16 @@ def configured(source: Source, exe: Executable, plan: pw_autoconfig.Plan, name: 
             environment.update(plan.environment)
             if plan.exe:
                 launcher = ""
+    checks = list(plan.checks)
     if launcher:
         base = posixpath.basename(launcher)
-        plan.checks = [pw_autoconfig.Check(
+        checks = [pw_autoconfig.Check(
             pw_autoconfig.OK,
             f"starts through {base}: the console can't start a second program, "
-            f"so {base} and the game run one after the other")] + list(plan.checks)
+            f"so {base} and the game run one after the other")] + checks
     return Game(name=name, slug=slugify(name), exe=game_exe.key, bits=game_exe.info.bits,
                 graphics=plan.graphics or guess_graphics(source, game_exe), arguments=" ".join(plan.arguments),
-                environment=environment, engine=plan.engine, checks=plan.checks, launcher=launcher)
+                environment=environment, engine=plan.engine, checks=checks, launcher=launcher)
 
 
 # .NET's runtime (Godot's C# builds, MonoGame, ...) starts by reserving
@@ -1622,6 +1669,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--name")
     parser.add_argument("--slug")
     parser.add_argument("--exe", help="the game's executable, inside its zip or folder")
+    parser.add_argument("--launcher", metavar="EXE|none",
+                        help="the program the game starts through (RA2.exe for Game.exe), or none")
     parser.add_argument("--graphics", choices=GRAPHICS)
     parser.add_argument("--arguments", default="")
     parser.add_argument("--desktop", default="1920x1080")
@@ -1655,13 +1704,20 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("give the game's zip or folder and --base")
         source, base = Source(args.game), Source(args.base)
         game, exes = suggest(source)
-        if args.exe:
-            match = next((exe for exe in exes if exe.key.lower() == args.exe.replace("\\", "/").lower()), None)
+
+        def program(path: str) -> Executable:
+            match = next((exe for exe in exes if exe.key.lower() == path.replace("\\", "/").lower()), None)
             if match is None:
-                raise QuickError(f"{args.exe} is not one of the game's executables: "
+                raise QuickError(f"{path} is not one of the game's executables: "
                                  + ", ".join(exe.key for exe in exes))
-            game.exe, game.bits = match.key, match.info.bits
-            game.graphics = guess_graphics(source, match)
+            return match
+
+        if args.exe:
+            game = choose_game(source, program(args.exe), exes, game.name)
+        if args.launcher:
+            exe = program(game.exe)
+            launcher = "" if args.launcher.lower() == "none" else program(args.launcher).key
+            game = configured(source, exe, plan_for(source, exe), game.name, exes, launcher=launcher)
         if args.name:
             game.name = args.name
             game.slug = slugify(args.name)

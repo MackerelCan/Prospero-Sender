@@ -34,6 +34,7 @@ SECRET = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ&start_r
 TITLE = f"prospero-win sender v{VERSION}: send a game to your PS5"
 SETTINGS = pw_quick.STATE_DIR / "settings.json"
 BASE_NAME = "prospero-base-prefix.zip"
+NO_LAUNCHER = "(none)"
 RESOLUTIONS = ("1920x1080", "1280x720", "2560x1440", "3840x2160", "1024x768", "800x600")
 GRAPHICS_LABELS = {
     "dxvk": "Direct3D 8-11 (DXVK)",
@@ -214,6 +215,7 @@ class App:
         self.game_path = tk.StringVar()
         self.name = tk.StringVar()
         self.exe = tk.StringVar()
+        self.launcher = tk.StringVar(value=NO_LAUNCHER)
         self.graphics = tk.StringVar()
         self.detected = tk.StringVar()
         self.desktop = tk.StringVar(value=settings.get("desktop", "1920x1080"))
@@ -294,7 +296,9 @@ class App:
         self.folder_button.grid(row=0, column=2, padx=(8, 0))
 
         rows = (("Name in the launcher", ttk.Entry(game, textvariable=self.name)),
-                ("Program to start", ttk.Combobox(game, textvariable=self.exe, state="readonly")),
+                ("Game program", ttk.Combobox(game, textvariable=self.exe, state="readonly")),
+                ("Start through", ttk.Combobox(game, textvariable=self.launcher, state="readonly",
+                                               values=[NO_LAUNCHER])),
                 ("Graphics", ttk.Combobox(game, textvariable=self.graphics, state="readonly",
                                           values=list(GRAPHICS_LABELS.values()))),
                 ("Resolution", ttk.Combobox(game, textvariable=self.desktop, values=RESOLUTIONS)),
@@ -309,10 +313,13 @@ class App:
             self.fields.append(widget)
         self.exe_box = self.fields[1]
         self.exe_box.bind("<<ComboboxSelected>>", self.exe_changed)
-        ttk.Label(game, textvariable=self.detected, style="Hint.TLabel").grid(row=3, column=2, sticky="w", padx=8)
-        ttk.Label(game, text="optional, e.g. warcraft3", style="Hint.TLabel").grid(row=5, column=2, sticky="w", padx=8)
-        ttk.Label(game, text="NAME=VALUE; …", style="Hint.TLabel").grid(row=7, column=2, sticky="w", padx=8)
-        ttk.Label(game, text="for logs, e.g. +seh", style="Hint.TLabel").grid(row=8, column=2, sticky="w", padx=8)
+        self.launcher_box = self.fields[2]
+        self.launcher_box.bind("<<ComboboxSelected>>", self.launcher_changed)
+        ttk.Label(game, text="a launcher, e.g. RA2.exe", style="Hint.TLabel").grid(row=3, column=2, sticky="w", padx=8)
+        ttk.Label(game, textvariable=self.detected, style="Hint.TLabel").grid(row=4, column=2, sticky="w", padx=8)
+        ttk.Label(game, text="optional, e.g. warcraft3", style="Hint.TLabel").grid(row=6, column=2, sticky="w", padx=8)
+        ttk.Label(game, text="NAME=VALUE; …", style="Hint.TLabel").grid(row=8, column=2, sticky="w", padx=8)
+        ttk.Label(game, text="for logs, e.g. +seh", style="Hint.TLabel").grid(row=9, column=2, sticky="w", padx=8)
         ttk.Label(game, textvariable=self.checks, wraplength=580, justify="left").grid(
             row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.set_fields("disabled")
@@ -351,7 +358,7 @@ class App:
 
     # --- helpers ---------------------------------------------------------------
     def set_fields(self, state: str) -> None:
-        resolution = self.fields[3]
+        resolution = self.fields[4]
         for widget in self.fields:
             choice_only = isinstance(widget, ttk.Combobox) and widget is not resolution
             widget.configure(state="readonly" if state == "normal" and choice_only else state)
@@ -649,20 +656,41 @@ class App:
 
     def show_game(self, game: pw_quick.Game) -> None:
         """What the sender worked out for this program (tools/pw_autoconfig.py)."""
-        self.found = (game.engine, game.checks, game.launcher)
         self.show_graphics(game.graphics)
         self.arguments.set(game.arguments)
         self.environment.set(pw_quick.format_environment(game.environment))
+        self.show_launcher(game)
+
+    def show_launcher(self, game: pw_quick.Game) -> None:
+        """The launcher choices for the game program, the chosen one, and the checks."""
+        self.found = (game.engine, game.checks, game.launcher)
+        self.launcher_box.configure(values=[NO_LAUNCHER] + pw_quick.launcher_choices(game.exe, self.exes))
+        self.launcher.set(game.launcher or NO_LAUNCHER)
         lines = [f"Engine: {game.engine}"] if game.engine else []
         self.checks.set("\n".join(lines + [str(check) for check in game.checks]))
 
     def exe_changed(self, _event=None) -> None:
+        """A game program picked by hand stays the game; only its launcher is guessed."""
         exe = self.current_exe()
         if exe and self.source:
-            exe, plan = pw_quick.autoconfigure(self.source, exe, self.exes)
-            game = pw_quick.configured(self.source, exe, plan, self.name.get(), self.exes)
+            game = pw_quick.choose_game(self.source, exe, self.exes, self.name.get())
             self.exe.set(game.exe)
             self.show_game(game)
+
+    def launcher_changed(self, _event=None) -> None:
+        """A launcher picked by hand (or none): the game program and its other
+        settings stay as they are."""
+        exe = self.current_exe()
+        if exe and self.source:
+            choice = "" if self.launcher.get() == NO_LAUNCHER else self.launcher.get()
+            try:
+                game = pw_quick.configured(self.source, exe, pw_quick.plan_for(self.source, exe),
+                                           self.name.get(), self.exes, launcher=choice)
+            except QuickError as error:
+                messagebox.showerror("prospero-win", str(error), parent=self.root)
+                self.launcher.set(self.found[2] or NO_LAUNCHER)
+                return
+            self.show_launcher(game)
 
     def current_exe(self) -> pw_quick.Executable | None:
         return next((exe for exe in self.exes if exe.key == self.exe.get()), None)
@@ -670,11 +698,14 @@ class App:
     def game_settings(self) -> pw_quick.Game:
         exe = self.current_exe()
         if exe is None:
-            raise QuickError("Choose the program to start.")
+            raise QuickError("Choose the game program.")
         name = self.name.get().strip() or exe.key
         graphics = next(key for key, label in GRAPHICS_LABELS.items() if label == self.graphics.get())
         found = getattr(self, "found", ("", [], ""))
-        engine, checks, launcher = (found[0], found[1], found[2] if len(found) > 2 else "")
+        engine, checks = found[0], found[1]
+        launcher = "" if self.launcher.get() == NO_LAUNCHER else self.launcher.get()
+        if launcher and launcher not in pw_quick.launcher_choices(exe.key, self.exes):
+            raise QuickError(f"{launcher} can't start {exe.key}: choose another program under Start through")
         game = pw_quick.Game(name=name, slug=pw_quick.slugify(name), exe=exe.key, bits=exe.info.bits,
                              graphics=graphics, arguments=self.arguments.get().strip(),
                              desktop=self.desktop.get().strip(), preset=self.preset.get().strip(),
