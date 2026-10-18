@@ -196,7 +196,9 @@ class App:
         root.config(menu=menubar)
 
         root.title(TITLE)
-        root.minsize(620, 0)
+        # bugfix: add scrollbar to main window for laptop
+        screen_height = root.winfo_screenheight()
+        root.geometry(f"760x{min(620, screen_height - 100)}")
         style = ttk.Style(root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
@@ -232,10 +234,71 @@ class App:
                                      if isinstance(entry, dict) and entry.get("path")]
         self.injecting = False
 
-        outer = ttk.Frame(root, padding=16)
-        outer.grid(sticky="nsew")
+        # bugfix: add scrollbar to main window for laptop
         root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(root)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            container,
+            orient="vertical",
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        outer = ttk.Frame(canvas, padding=16)
+        window_id = canvas.create_window(
+            (0, 0),
+            window=outer,
+            anchor="nw",
+        )
+
+        def update_scroll_region(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def update_content_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        outer.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", update_content_width)
+
+        # Windows / macOS: mouse wheel
+        # Linux: Button-4 / Button-5
+        def on_mousewheel(event):
+            if event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+            elif event.delta:
+                canvas.yview_scroll(
+                    int(-event.delta / 120), "units"
+                )
+
+        def bind_mousewheel(event):
+            if sys.platform.startswith("linux"):
+                canvas.bind_all("<Button-4>", on_mousewheel)
+                canvas.bind_all("<Button-5>", on_mousewheel)
+            else:
+                canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        def unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", bind_mousewheel)
+        canvas.bind("<Leave>", unbind_mousewheel)
+
         outer.columnconfigure(0, weight=1)
+        
         ttk.Label(outer, text="Send a game to your PS5", style="Title.TLabel").grid(sticky="w")
         ttk.Label(outer, style="Hint.TLabel", wraplength=580, justify="left",
                   text="For games that are already installed: a folder copied from a Windows PC, "
